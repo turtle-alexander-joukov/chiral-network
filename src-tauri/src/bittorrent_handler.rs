@@ -204,19 +204,6 @@ impl BitTorrentHandler {
             download_directory, listen_port_range
         );
 
-        // Clean up any stale DHT or session state files that might be locked
-        let state_files = ["session.json", "dht.json", "dht.db", "session.db"];
-        for file in &state_files {
-            let state_path = download_directory.join(file);
-            if state_path.exists() {
-                if let Err(e) = std::fs::remove_file(&state_path) {
-                    warn!("Failed to remove stale state file {:?}: {}", state_path, e);
-                } else {
-                    info!("Removed stale state file: {:?}", state_path);
-                }
-            }
-        }
-
         let mut opts = SessionOptions::default();
 
         // Set port range if provided (helps run multiple instances)
@@ -224,11 +211,15 @@ impl BitTorrentHandler {
             opts.listen_port_range = Some(range);
         }
 
-        // Disable DHT entirely to avoid conflicts between multiple instances
-        opts.disable_dht = true;
-        opts.persistence = None;
+        // Enable DHT without persistent state to avoid initialization issues
+        // DHT will work in-memory only, which is fine for development
+        opts.disable_dht = false;
+        opts.persistence = None; // Disable all persistence including DHT
         
-        info!("Initializing session with disable_dht=true, persistence=None");
+        info!(
+            "Initializing session with DHT enabled (no persistence), download_directory: {:?}",
+            download_directory
+        );
         let session = Session::new_with_opts(download_directory.clone(), opts).await.map_err(|e| {
             error!("Session initialization failed: {}", e);
             BitTorrentError::SessionInit {
