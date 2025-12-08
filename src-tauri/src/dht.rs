@@ -739,7 +739,8 @@ fn construct_file_metadata_from_json_simple(
             .unwrap_or(None)
         }),
         uploader_address: metadata_json
-            .get("uploader_address")
+            .get("uploaderAddress")
+            .or_else(|| metadata_json.get("uploader_address"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         ftp_sources: metadata_json.get("ftpSources").and_then(|v| {
@@ -1552,7 +1553,7 @@ async fn run_dht_node(
                                                 trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
                                                 is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
                                                 price: json_val.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                uploader_address: json_val.get("uploaderAddress").or_else(|| json_val.get("uploader_address")).and_then(|v| v.as_str()).map(|s| s.to_string()),
                                                 http_sources: json_val.get("httpSources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ed2k_sources: json_val.get("ed2kSources").and_then(|v| {serde_json::from_value::<Option<Vec<Ed2kSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ftp_sources: json_val.get("ftpSources").and_then(|v| {serde_json::from_value::<Option<Vec<FtpSourceInfo>>>(v.clone()).unwrap_or(None)}),
@@ -1712,12 +1713,12 @@ async fn run_dht_node(
                                     "seeders": merged_metadata.seeders,
                                     "seederHeartbeats": active_heartbeats,
                                     "price": metadata.price,
-                                    "uploader_address": metadata.uploader_address,
+                                    "uploaderAddress": metadata.uploader_address,
                                     "httpSources": metadata.http_sources,
                                     "ed2kSources": metadata.ed2k_sources,
                                     "ftpSources": metadata.ftp_sources,
                                     "price": merged_metadata.price,
-                                    "uploader_address": merged_metadata.uploader_address,
+                                    "uploaderAddress": merged_metadata.uploader_address,
                                     "http_sources": merged_metadata.http_sources,
                                     "ed2k_sources": merged_metadata.ed2k_sources,
                                 });
@@ -1876,7 +1877,7 @@ async fn run_dht_node(
                                     "trackers": metadata.trackers,
                                     "parentHash": metadata.parent_hash,
                                     "price": metadata.price,
-                                    "uploader_address": metadata.uploader_address,
+                                    "uploaderAddress": metadata.uploader_address,
                                     "seeders": metadata.seeders,
                                     "seederHeartbeats": active_heartbeats,
                                 });
@@ -3544,7 +3545,7 @@ async fn run_dht_node(
                                                 trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
                                                 is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
                                                 price: json_val.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                uploader_address: json_val.get("uploaderAddress").or_else(|| json_val.get("uploader_address")).and_then(|v| v.as_str()).map(|s| s.to_string()),
                                                 http_sources: json_val.get("httpSources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ed2k_sources: json_val.get("ed2kSources").and_then(|v| {serde_json::from_value::<Option<Vec<Ed2kSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ftp_sources: json_val.get("ftpSources").and_then(|v| {serde_json::from_value::<Option<Vec<FtpSourceInfo>>>(v.clone()).unwrap_or(None)}),
@@ -4737,7 +4738,8 @@ async fn handle_kademlia_event(
                                         .unwrap_or(None)
                                     }),
                                     uploader_address: metadata_json
-                                        .get("uploader_address")
+                                        .get("uploaderAddress")
+                                        .or_else(|| metadata_json.get("uploader_address"))
                                         .and_then(|v| v.as_str())
                                         .map(|s| s.to_string()),
                                     ..Default::default()
@@ -5081,7 +5083,7 @@ async fn handle_kademlia_event(
                                                     trackers: metadata_json.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
                                                     is_root: metadata_json.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
                                                     price: metadata_json.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                    uploader_address: metadata_json.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                    uploader_address: metadata_json.get("uploaderAddress").or_else(|| metadata_json.get("uploader_address")).and_then(|v| v.as_str()).map(|s| s.to_string()),
                                                     http_sources: metadata_json.get("httpSources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                     ed2k_sources: metadata_json.get("ed2kSources").and_then(|v| {serde_json::from_value::<Option<Vec<Ed2kSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                     ftp_sources: metadata_json.get("ftpSources").and_then(|v| {serde_json::from_value::<Option<Vec<FtpSourceInfo>>>(v.clone()).unwrap_or(None)}),
