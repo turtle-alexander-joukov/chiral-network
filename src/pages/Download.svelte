@@ -191,6 +191,59 @@
                 chunkSize: progress.chunkSize
             });
 
+            // Find the file being downloaded to get payment info
+            const downloadingFile = $files.find(f => f.hash === progress.fileHash && f.status === 'downloading');
+            
+            // Process batched chunk payment (every 100 chunks) using uploaderAddress
+            if (downloadingFile && downloadingFile.uploaderAddress) {
+                const seederWalletAddress = paymentService.isValidWalletAddress(downloadingFile.uploaderAddress)
+                    ? downloadingFile.uploaderAddress
+                    : null;
+                
+                if (seederWalletAddress) {
+                    const BATCH_SIZE = 100;
+                    const chunkNum = progress.chunkIndex + 1; // 1-indexed
+                    const isLastChunk = chunkNum === progress.totalChunks;
+                    const isBatchComplete = chunkNum % BATCH_SIZE === 0;
+                    
+                    // Send payment every 100 chunks OR on the last chunk
+                    if (isBatchComplete || isLastChunk) {
+                        // Calculate how many chunks in this batch
+                        const chunksInBatch = isLastChunk && !isBatchComplete 
+                            ? (chunkNum % BATCH_SIZE) || BATCH_SIZE  // Remaining chunks
+                            : BATCH_SIZE;
+                        
+                        const totalCost = await paymentService.calculateDownloadCost(downloadingFile.size);
+                        const batchCost = (totalCost / progress.totalChunks) * chunksInBatch;
+                        const batchNum = Math.ceil(chunkNum / BATCH_SIZE);
+                        const totalBatches = Math.ceil(progress.totalChunks / BATCH_SIZE);
+                        
+                        console.log(`💰 Processing batch payment ${batchNum}/${totalBatches} (${chunksInBatch} chunks): ${batchCost.toFixed(6)} Chiral to ${seederWalletAddress}`);
+                        
+                        // Queue the payment (don't await - let it process in background)
+                        paymentService.sendBatchPayment(
+                            progress.fileHash,
+                            downloadingFile.name,
+                            batchCost,
+                            batchNum,
+                            totalBatches,
+                            chunksInBatch,
+                            seederWalletAddress
+                        ).then(result => {
+                            if (result.success) {
+                                console.log(`✅ Batch ${batchNum}/${totalBatches} payment queued, txId: ${result.transactionId}`);
+                            } else {
+                                console.error(`❌ Batch payment failed: ${result.error}`);
+                            }
+                        }).catch(error => {
+                            console.error('💥 Exception processing batch payment:', error);
+                        });
+                    }
+                } else {
+                    console.warn('⚠️ Invalid uploader wallet address, skipping payment:', downloadingFile.uploaderAddress);
+                }
+            }
+
             // Only update files that are actively downloading, not seeding files with the same hash
             files.update(f => {
                 // Log all downloading files to help debug hash matching
@@ -280,64 +333,15 @@
             const completedFile = $files.find(f => f.hash === metadata.merkleRoot);
 
             if (completedFile && !paidFiles.has(completedFile.hash)) {
-                // Process payment for Bitswap download (single payment at completion)
-                diagnosticLogger.info('Download', 'Bitswap download completed, processing payment', { fileName: completedFile.name });
+                // Payments were already processed per-chunk during download
+                // Just mark as paid and show completion message
+                paidFiles.add(completedFile.hash);
                 const paymentAmount = await paymentService.calculateDownloadCost(completedFile.size);
-
-                // Use uploaderAddress for payment (wallet address of the uploader)
-                const seederWalletAddress = paymentService.isValidWalletAddress(completedFile.uploaderAddress)
-                  ? completedFile.uploaderAddress!
-                  : null;
-                
-                if (!seederWalletAddress) {
-                  diagnosticLogger.warn('Download', 'Skipping Bitswap payment due to missing or invalid uploader wallet address', {
-                      file: completedFile.name,
-                      uploaderAddress: completedFile.uploaderAddress
-                  });
-                  showToast('Download completed - payment skipped (missing uploader wallet address)', 'warning');
-              } else {
-                    try {
-                        const paymentResult = await paymentService.processDownloadPayment(
-                            completedFile.hash,
-                            completedFile.name,
-                            completedFile.size,
-                            seederWalletAddress,
-                            seederWalletAddress // Use wallet address for reputation tracking
-                        );
-
-                        if (paymentResult.success) {
-                            paidFiles.add(completedFile.hash); // Mark as paid
-                            
-                            // Update reputation for the seeder peer after successful payment
-                            if (seederPeerId) {
-                              try {
-                                await invoke('record_transfer_success', {
-                                  peerId: seederPeerId,
-                                  bytes: completedFile.size,
-                                  durationMs: 0, // Bitswap doesn't track duration here
-                                });
-                                // Also update frontend reputation store for immediate UI feedback
-                                PeerSelectionService.notePeerSuccess(seederPeerId);
-                                console.log(`✅ Updated reputation for seeder peer ${seederPeerId.substring(0, 20)}... after Bitswap download (+${completedFile.size} bytes)`);
-                              } catch (repError) {
-                                console.error('Failed to update seeder reputation:', repError);
-                              }
-                            }
-                            
-                            diagnosticLogger.info('Download', 'Bitswap payment processed', { 
-                                amount: paymentAmount.toFixed(6), 
-                                seederWalletAddress
-                            });
-                            showToast(`Bitswap download completed! Paid ${paymentAmount.toFixed(4)} Chiral`, 'success');
-                        } else {
-                            errorLogger.fileOperationError('Bitswap payment', paymentResult.error || 'Unknown error');
-                            showToast(`Download completed but payment failed: ${paymentResult.error}`, 'warning');
-                        }
-                    } catch (error) {
-                        errorLogger.fileOperationError('Bitswap payment processing', error instanceof Error ? error.message : String(error));
-                        showToast(`Download completed but payment failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 'warning');
-                    }
-                }
+                diagnosticLogger.info('Download', 'Bitswap download completed (payments processed per-chunk)', { 
+                    fileName: completedFile.name,
+                    totalPaid: paymentAmount.toFixed(6)
+                });
+                showToast(`Bitswap download completed! Total paid: ${paymentAmount.toFixed(4)} Chiral`, 'success');
             }
 
             // Update file status - update files that are actively downloading OR might be stuck

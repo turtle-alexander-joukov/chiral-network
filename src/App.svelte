@@ -170,6 +170,8 @@ function handleFirstRunComplete() {
     let stopGethMonitoring: () => void = () => {};
     let unlistenSeederPayment: (() => void) | null = null;
     let unlistenTorrentPayment: (() => void) | null = null;
+    let unlistenTransactionSent: (() => void) | null = null;
+    let unlistenTransactionFailed: (() => void) | null = null;
     let transferEventsUnsubscribe: (() => void) | null = null;
     let unsubscribeGethStatus: (() => void) | null = null;
 
@@ -330,6 +332,39 @@ function handleFirstRunComplete() {
             },
           );
           unlistenSeederPayment = unlisten;
+
+          // Listen for transaction confirmations (for chunk payments)
+          const unlistenTxSent = await listen(
+            "transaction_sent",
+            async (event: any) => {
+              const payload = event.payload;
+              console.log("✅ Transaction confirmed on blockchain:", payload);
+              
+              // Add confirmed transaction to history
+              paymentService.handleTransactionConfirmed(
+                payload.id,
+                payload.txHash,
+                payload.to,
+                payload.amount
+              );
+            }
+          );
+          unlistenTransactionSent = unlistenTxSent;
+
+          // Listen for transaction failures
+          const unlistenTxFailed = await listen(
+            "transaction_failed",
+            async (event: any) => {
+              const payload = event.payload;
+              console.error("❌ Transaction failed:", payload);
+              
+              paymentService.handleTransactionFailed(
+                payload.id,
+                payload.error
+              );
+            }
+          );
+          unlistenTransactionFailed = unlistenTxFailed;
         } catch (error) {
           console.error("Failed to setup payment listener:", error);
         }
@@ -796,6 +831,12 @@ function handleFirstRunComplete() {
       }
       if (unlistenTorrentPayment) {
         unlistenTorrentPayment();
+      }
+      if (unlistenTransactionSent) {
+        unlistenTransactionSent();
+      }
+      if (unlistenTransactionFailed) {
+        unlistenTransactionFailed();
       }
       if (transferEventsUnsubscribe) {
         transferEventsUnsubscribe();
