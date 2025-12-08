@@ -193,12 +193,27 @@
 
             // Find the file being downloaded to get seeder info
             const downloadingFile = $files.find(f => f.hash === progress.fileHash && f.status === 'downloading');
+            
+            console.log('🔍 Chunk payment debug:', {
+                downloadingFile: downloadingFile ? {
+                    name: downloadingFile.name,
+                    hash: downloadingFile.hash,
+                    uploaderAddress: downloadingFile.uploaderAddress,
+                    status: downloadingFile.status
+                } : null
+            });
 
-            // Process chunk payment
-            if (downloadingFile && downloadingFile.seederAddresses && downloadingFile.seederAddresses.length > 0) {
-                const seederWalletAddress = paymentService.isValidWalletAddress(downloadingFile.seederAddresses[0])
-                    ? downloadingFile.seederAddresses[0]!
+            // Process chunk payment using uploaderAddress (wallet address of the file owner)
+            if (downloadingFile && downloadingFile.uploaderAddress) {
+                const seederWalletAddress = paymentService.isValidWalletAddress(downloadingFile.uploaderAddress)
+                    ? downloadingFile.uploaderAddress
                     : null;
+                
+                console.log('💰 Attempting chunk payment:', {
+                    chunkIndex: progress.chunkIndex,
+                    seederWalletAddress,
+                    isValid: !!seederWalletAddress
+                });
                 
                 if (seederWalletAddress) {
                     try {
@@ -209,20 +224,27 @@
                             progress.chunkIndex,
                             progress.totalChunks,
                             seederWalletAddress,
-                            downloadingFile.seederAddresses[0] // Use as peer ID if needed
+                            seederWalletAddress // Use wallet address for reputation tracking
                         );
 
                         if (paymentResult.success) {
-                            console.log(`✅ Chunk ${progress.chunkIndex + 1}/${progress.totalChunks} payment processed`);
+                            console.log(`✅ Chunk ${progress.chunkIndex + 1}/${progress.totalChunks} payment processed, txHash: ${paymentResult.transactionHash}`);
                         } else {
-                            console.warn(`⚠️ Chunk payment failed: ${paymentResult.error}`);
+                            console.error(`❌ Chunk payment failed: ${paymentResult.error}`);
+                            showToast(`Chunk payment failed: ${paymentResult.error}`, 'error');
                         }
                     } catch (error) {
-                        console.error('Error processing chunk payment:', error);
+                        console.error('💥 Exception processing chunk payment:', error);
+                        showToast(`Chunk payment error: ${error}`, 'error');
                     }
                 } else {
-                    console.warn('⚠️ Skipping chunk payment: invalid seeder wallet address');
+                    console.warn('⚠️ Skipping chunk payment: invalid uploader wallet address', downloadingFile.uploaderAddress);
                 }
+            } else {
+                console.warn('⚠️ Skipping chunk payment: no downloading file or uploader address', {
+                    hasFile: !!downloadingFile,
+                    uploaderAddress: downloadingFile?.uploaderAddress
+                });
             }
 
             // Only update files that are actively downloading, not seeding files with the same hash
@@ -971,7 +993,7 @@ async function loadAndResumeDownloads() {
       status: 'queued' as const,
       priority: 'normal' as const,
       seeders: metadata.seeders.length, // Convert array length to number
-      seederAddresses: metadata.seeders, // Array that only contains selected seeder rather than all seeders
+      seederAddresses: metadata.seeders, // Peer IDs for P2P connections
       // Pass encryption info to the download item
       isEncrypted: metadata.isEncrypted,
       manifest: metadata.manifest ? JSON.parse(metadata.manifest) : null,
