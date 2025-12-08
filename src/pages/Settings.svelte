@@ -133,6 +133,9 @@
 
     // Upload Protocol
     selectedProtocol: "Bitswap", // Default to Bitswap
+
+    // Payment Settings
+    chunksPerPaymentBatch: 10, // Default: prepay for 10 chunks at a time
   };
   let localSettings: AppSettings = JSON.parse(JSON.stringify(get(settings)));
   let savedSettings: AppSettings = JSON.parse(JSON.stringify(localSettings));
@@ -2307,6 +2310,18 @@ function sectionMatches(section: string, query: string) {
           </Label>
         </div>
 
+        <div>
+          <Label for="chunks-per-payment">{$t("advanced.chunksPerPayment")}</Label>
+          <p class="text-xs text-muted-foreground mb-2">{$t("advanced.chunksPerPaymentDescription")}</p>
+          <Input
+            id="chunks-per-payment"
+            type="number"
+            bind:value={localSettings.chunksPerPaymentBatch}
+            min="1"
+            max="100"
+            class="mt-2 max-w-32"
+          />
+        </div>
 
         <div class="flex flex-wrap gap-2">
           <Button

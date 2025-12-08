@@ -762,6 +762,109 @@ export class PaymentService {
       console.error("Error handling payment notification:", error);
     }
   }
+
+  /**
+   * Process payment for a batch of chunks during Bitswap download
+   * Called before requesting chunks to prepay for the batch
+   */
+  static async processChunkBatchPayment(
+    fileHash: string,
+    fileName: string,
+    seederAddress: string,
+    batchStartChunk: number,
+    batchEndChunk: number,
+    pricePerChunk: number
+  ): Promise<{
+    success: boolean;
+    transactionHash?: string;
+    error?: string;
+  }> {
+    try {
+      const numChunks = batchEndChunk - batchStartChunk + 1;
+      const totalAmount = numChunks * pricePerChunk;
+
+      console.log(`💰 Processing chunk batch payment: chunks ${batchStartChunk}-${batchEndChunk} (${numChunks} chunks) for ${totalAmount} Chiral`);
+
+      if (!seederAddress || !this.WALLET_ADDRESS_REGEX.test(seederAddress)) {
+        return {
+          success: false,
+          error: "Invalid seeder wallet address",
+        };
+      }
+
+      // Check if user has sufficient balance
+      if (!this.hasSufficientBalance(totalAmount)) {
+        return {
+          success: false,
+          error: `Insufficient balance. Need ${totalAmount.toFixed(4)} Chiral`,
+        };
+      }
+
+      // Send the payment via backend
+      const txHash = await invoke<string>("process_chunk_batch_payment", {
+        seederAddress,
+        fileHash,
+        fileName,
+        batchStartChunk,
+        batchEndChunk,
+        pricePerChunk,
+      });
+
+      // Update wallet balance
+      const currentWallet = get(wallet);
+      const newBalance = parseFloat((currentWallet.balance - totalAmount).toFixed(8));
+      wallet.update((w) => {
+        const updated = { ...w, balance: newBalance };
+        saveWalletToStorage(updated);
+        return updated;
+      });
+
+      // Add transaction to history
+      const currentTransactions = get(transactions);
+      const transactionId = currentTransactions.length > 0
+        ? Math.max(...currentTransactions.map((tx) => tx.id)) + 1
+        : 1;
+
+      const newTransaction: Transaction = {
+        id: transactionId,
+        type: "sent",
+        amount: totalAmount,
+        to: seederAddress,
+        from: currentWallet.address,
+        txHash: txHash,
+        date: new Date(),
+        description: `Chunk batch ${batchStartChunk}-${batchEndChunk}: ${fileName}`,
+        status: "pending",
+      };
+
+      transactions.update((txs) => {
+        const updated = [newTransaction, ...txs];
+        saveTransactionsToStorage(updated);
+        return updated;
+      });
+
+      console.log(`✅ Chunk batch payment sent: ${txHash}`);
+
+      return {
+        success: true,
+        transactionHash: txHash,
+      };
+    } catch (error) {
+      console.error("Error processing chunk batch payment:", error);
+      return {
+        success: false,
+        error: error instanceof Error ? error.message : "Unknown error occurred",
+      };
+    }
+  }
+
+  /**
+   * Calculate price per chunk based on file price and total chunks
+   */
+  static calculatePricePerChunk(filePrice: number, totalChunks: number): number {
+    if (totalChunks <= 0) return 0;
+    return filePrice / totalChunks;
+  }
 }
 
 // Export singleton instance

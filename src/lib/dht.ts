@@ -2,6 +2,8 @@
 import { invoke } from "@tauri-apps/api/core";
 import { listen } from "@tauri-apps/api/event";
 import { join } from "@tauri-apps/api/path";
+import { get } from "svelte/store";
+import { settings } from "$lib/stores";
 //importing reputation store for the reputation based peer discovery
 import ReputationStore from "$lib/reputationStore";
 const __rep = ReputationStore.getInstance();
@@ -340,13 +342,20 @@ export class DhtService {
             fileHash: fileMetadata.fileHash,
             fileName: fileMetadata.fileName,
             cidsCount: fileMetadata.cids?.length,
+            uploaderAddress: fileMetadata.uploaderAddress,
+            price: fileMetadata.price,
           }
         );
+
+        // Get the chunks per payment batch from settings
+        const currentSettings = get(settings);
+        const chunksPerPaymentBatch = currentSettings.chunksPerPaymentBatch || 10;
 
         // Trigger the backend download AFTER setting up the listener
         await invoke("download_blocks_from_network", {
           fileMetadata,
           downloadPath: resolvedStoragePath,
+          chunksPerPaymentBatch,
         });
       } catch (error) {
         console.error(

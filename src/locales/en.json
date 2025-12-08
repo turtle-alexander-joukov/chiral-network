@@ -516,6 +516,8 @@
   "advanced.logInfo": "Info",
   "advanced.logDebug": "Debug",
   "advanced.autoUpdate": "Automatically install updates",
+  "advanced.chunksPerPayment": "Chunks Per Payment Batch",
+  "advanced.chunksPerPaymentDescription": "Number of chunks to prepay for when downloading files. Seller waits for payment before sending chunks.",
   "advanced.clearCache": "Clear Cache",
   "advanced.exportSettings": "Export Settings",
   "advanced.importSettings": "Import Settings",

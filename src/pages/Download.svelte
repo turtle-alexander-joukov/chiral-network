@@ -6,7 +6,7 @@
   import Badge from '$lib/components/ui/badge.svelte'
   import Progress from '$lib/components/ui/progress.svelte'
   import { Search, Pause, Play, X, ChevronUp, ChevronDown, Settings, FolderOpen, File as FileIcon, FileText, FileImage, FileVideo, FileAudio, Archive, Code, FileSpreadsheet, Presentation, History, Download as DownloadIcon, Upload as UploadIcon, Trash2, RefreshCw } from 'lucide-svelte'
-  import { files, downloadQueue, activeTransfers, wallet, type FileItem } from '$lib/stores'
+  import { files, downloadQueue, activeTransfers, wallet, transactions, type FileItem, type Transaction } from '$lib/stores'
   import { dhtService } from '$lib/dht'
   import { paymentService } from '$lib/services/paymentService'
   import DownloadSearchSection from '$lib/components/download/DownloadSearchSection.svelte'
@@ -266,6 +266,101 @@
                 return file;
             });
             });
+        });
+
+        // Listen for chunk batch payment required events
+        const unlistenChunkBatchPayment = await listen('chunk_batch_payment_required', async (event) => {
+            const paymentInfo = event.payload as {
+                fileHash: string;
+                fileName: string;
+                seederAddress: string | null;
+                batchStartChunk: number;
+                batchEndChunk: number;
+                totalChunks: number;
+                pricePerChunk: number;
+                totalBatchPrice: number;
+            };
+
+            console.log('💰 CHUNK BATCH PAYMENT REQUIRED:', paymentInfo);
+            
+            // Log payment requirement details
+            diagnosticLogger.info('Download', 'Chunk batch payment required', {
+                fileHash: paymentInfo.fileHash,
+                fileName: paymentInfo.fileName,
+                batch: `${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}`,
+                totalChunks: paymentInfo.totalChunks,
+                pricePerChunk: paymentInfo.pricePerChunk,
+                totalBatchPrice: paymentInfo.totalBatchPrice,
+                seederAddress: paymentInfo.seederAddress
+            });
+
+            // Process payment if seeder has a valid wallet address
+            if (paymentInfo.seederAddress && paymentInfo.totalBatchPrice > 0) {
+                try {
+                    console.log(`💰 Processing prepayment for batch ${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}: ${paymentInfo.totalBatchPrice} Chiral to ${paymentInfo.seederAddress}`);
+                    
+                    const result = await paymentService.processChunkBatchPayment(
+                        paymentInfo.fileHash,
+                        paymentInfo.fileName,
+                        paymentInfo.seederAddress,
+                        paymentInfo.batchStartChunk,
+                        paymentInfo.batchEndChunk,
+                        paymentInfo.pricePerChunk
+                    );
+
+                    if (result.success) {
+                        console.log(`✅ Chunk batch payment SUCCESS: tx=${result.transactionHash}`);
+                        diagnosticLogger.info('Download', 'Chunk batch payment processed', {
+                            txHash: result.transactionHash,
+                            batch: `${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}`,
+                            amount: paymentInfo.totalBatchPrice
+                        });
+                        
+                        // Also record the seeder's credit (incoming payment)
+                        // This creates the + transaction in the seeder's transaction list
+                        const currentWallet = get(wallet);
+                        if (currentWallet.address) {
+                            // Add the received transaction directly with the actual batch price
+                            const currentTransactions = get(transactions);
+                            const transactionId = currentTransactions.length > 0
+                                ? Math.max(...currentTransactions.map((tx: Transaction) => tx.id)) + 1
+                                : 1;
+                            
+                            const seederTransaction: Transaction = {
+                                id: transactionId,
+                                type: 'received',
+                                amount: paymentInfo.totalBatchPrice,
+                                from: currentWallet.address, // downloader address
+                                to: paymentInfo.seederAddress, // seeder address
+                                txHash: result.transactionHash,
+                                date: new Date(),
+                                description: `Upload payment: ${paymentInfo.fileName} (batch ${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk})`,
+                                status: 'success'
+                            };
+                            
+                            transactions.update((txs: Transaction[]) => {
+                                const updated = [seederTransaction, ...txs];
+                                // Persist to localStorage
+                                try {
+                                    localStorage.setItem('chiral_transactions', JSON.stringify(updated));
+                                } catch (e) {
+                                    console.warn('Failed to persist transactions:', e);
+                                }
+                                return updated;
+                            });
+                            console.log(`✅ Seeder credit recorded for batch ${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}: +${paymentInfo.totalBatchPrice} Chiral`);
+                        }
+                    } else {
+                        console.error(`❌ Chunk batch payment FAILED: ${result.error}`);
+                        errorLogger.fileOperationError('Chunk batch payment', result.error || 'Unknown error');
+                    }
+                } catch (error) {
+                    console.error('❌ Chunk batch payment ERROR:', error);
+                    errorLogger.fileOperationError('Chunk batch payment', error instanceof Error ? error.message : String(error));
+                }
+            } else {
+                console.log('⚠️ Skipping payment: No valid seeder address or zero price');
+            }
         });
 
         const unlistenDownloadCompleted = await listen('file_content', async (event) => {
@@ -614,6 +709,7 @@ const unlistenWebRTCComplete = await listen('webrtc_download_complete', async (e
           unlistenStarted()
           unlistenFailed()
           unlistenBitswapProgress()
+          unlistenChunkBatchPayment()
           unlistenDownloadCompleted()
           unlistenDhtError()
           unlistenWebRTCProgress()
@@ -1451,7 +1547,8 @@ async function loadAndResumeDownloads() {
       manifest: downloadingFile.manifest ? JSON.stringify(downloadingFile.manifest) : undefined,
       cids: downloadingFile.cids,
       downloadPath: fullPath,  // Pass the full path
-      price: downloadingFile.price ?? 0  // Add price field
+      price: downloadingFile.price ?? 0,  // Add price field
+      uploaderAddress: downloadingFile.uploaderAddress  // Wallet address for payment
     }
 
     console.log('📦 Bitswap download starting:', {
@@ -1459,7 +1556,9 @@ async function loadAndResumeDownloads() {
       fileName: metadata.fileName,
       fileSize: metadata.fileSize,
       cidsCount: metadata.cids?.length,
-      seedersCount: metadata.seeders?.length
+      seedersCount: metadata.seeders?.length,
+      uploaderAddress: metadata.uploaderAddress,
+      price: metadata.price
     });
 
     // Start the download asynchronously

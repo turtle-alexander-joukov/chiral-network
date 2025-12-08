@@ -44,8 +44,17 @@ fn merge_file_metadata(
     existing: crate::dht::models::FileMetadata,
     new: crate::dht::models::FileMetadata,
 ) -> crate::dht::models::FileMetadata {
+    tracing::info!("💰 MERGE: existing.uploader_address = {:?}", existing.uploader_address);
+    tracing::info!("💰 MERGE: new.uploader_address = {:?}", new.uploader_address);
     // Keep the most recent metadata as base, but merge protocol-specific fields
     let mut merged = new.clone();
+    
+    // IMPORTANT: If new doesn't have uploader_address but existing does, keep existing
+    if merged.uploader_address.is_none() && existing.uploader_address.is_some() {
+        tracing::info!("💰 MERGE: Using EXISTING uploader_address since new is None");
+        merged.uploader_address = existing.uploader_address.clone();
+    }
+    tracing::info!("💰 MERGE: RESULT merged.uploader_address = {:?}", merged.uploader_address);
 
     // Merge seeders (combine unique addresses)
     let mut all_seeders = existing.seeders.clone();
@@ -331,7 +340,11 @@ pub enum DhtCommand {
         file_hash: String,
         sender: oneshot::Sender<Result<Option<FileMetadata>, String>>,
     },
-    DownloadFile(FileMetadata, String),
+    DownloadFile {
+        metadata: FileMetadata,
+        download_path: String,
+        chunks_per_payment_batch: u32,
+    },
     ConnectPeer(String),
     ConnectToPeerById(PeerId),
     DisconnectPeer(PeerId),
@@ -483,6 +496,17 @@ pub enum DhtEvent {
     PaymentNotificationReceived {
         from_peer: String,
         payload: serde_json::Value,
+    },
+    /// Emitted when a batch of chunks requires prepayment before download
+    ChunkBatchPaymentRequired {
+        file_hash: String,
+        file_name: String,
+        seeder_address: Option<String>,
+        batch_start_chunk: u32,
+        batch_end_chunk: u32,
+        total_chunks: u32,
+        price_per_chunk: f64,
+        total_batch_price: f64,
     },
 }
 
@@ -765,7 +789,8 @@ fn construct_file_metadata_from_json_simple(
             .unwrap_or(None)
         }),
         uploader_address: metadata_json
-            .get("uploader_address")
+            .get("uploaderAddress")
+            .or_else(|| metadata_json.get("uploader_address"))
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()),
         ftp_sources: metadata_json.get("ftpSources").and_then(|v| {
@@ -1578,7 +1603,7 @@ async fn run_dht_node(
                                                 trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
                                                 is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
                                                 price: json_val.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                uploader_address: json_val.get("uploaderAddress").or_else(|| json_val.get("uploader_address")).and_then(|v| v.as_str()).map(|s| s.to_string()),
                                                 http_sources: json_val.get("httpSources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ed2k_sources: json_val.get("ed2kSources").and_then(|v| {serde_json::from_value::<Option<Vec<Ed2kSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ftp_sources: json_val.get("ftpSources").and_then(|v| {serde_json::from_value::<Option<Vec<FtpSourceInfo>>>(v.clone()).unwrap_or(None)}),
@@ -1686,6 +1711,8 @@ async fn run_dht_node(
                                 let peer_id_str = peer_id.to_string();
                                 info!("🔍 DEBUG DHT PUBLISH: Local peer_id = {}", peer_id_str);
                                 info!("🔍 DEBUG DHT PUBLISH: File hash = {}", metadata.merkle_root);
+                                info!("💰 DEBUG PUBLISH: INCOMING metadata.uploader_address = {:?}", metadata.uploader_address);
+                                info!("💰 DEBUG PUBLISH: INCOMING metadata.price = {}", metadata.price);
                                 let existing_heartbeats = {
                                     let cache = seeder_heartbeats_cache.lock().await;
                                     cache
@@ -1711,12 +1738,17 @@ async fn run_dht_node(
                                         info!("🔍 DEBUG DHT PUBLISH: New CIDs: {:?}, FTP sources: {}", metadata.cids, metadata.ftp_sources.as_ref().map(|v| v.len()).unwrap_or(0));
                                         let merged = merge_file_metadata(existing.clone(), metadata.clone());
                                         info!("🔍 DEBUG DHT PUBLISH: Final merged CIDs: {:?}, FTP sources: {}", merged.cids, merged.ftp_sources.as_ref().map(|v| v.len()).unwrap_or(0));
+                                        info!("💰 DEBUG PUBLISH: EXISTING metadata.uploader_address = {:?}", existing.uploader_address);
+                                        info!("💰 DEBUG PUBLISH: MERGED metadata.uploader_address = {:?}", merged.uploader_address);
                                         merged
                                     } else {
                                         info!("🔍 DEBUG DHT PUBLISH: No existing metadata, using new metadata. CIDs: {:?}, FTP sources: {}", metadata.cids, metadata.ftp_sources.as_ref().map(|v| v.len()).unwrap_or(0));
+                                        info!("💰 DEBUG PUBLISH: NO EXISTING - using metadata.uploader_address = {:?}", metadata.uploader_address);
                                         metadata.clone()
                                     }
                                 };
+                                
+                                info!("💰 DEBUG PUBLISH: FINAL merged_metadata.uploader_address = {:?}", merged_metadata.uploader_address);
 
                                 // Store minimal metadata in DHT (using merged metadata)
                                 let dht_metadata = serde_json::json!({
@@ -1737,16 +1769,16 @@ async fn run_dht_node(
                                     "trackers": merged_metadata.trackers,
                                     "seeders": merged_metadata.seeders,
                                     "seederHeartbeats": active_heartbeats,
-                                    "price": metadata.price,
-                                    "uploader_address": metadata.uploader_address,
+                                    "price": merged_metadata.price,
+                                    "uploaderAddress": merged_metadata.uploader_address,
                                     "httpSources": metadata.http_sources,
                                     "ed2kSources": metadata.ed2k_sources,
                                     "ftpSources": metadata.ftp_sources,
-                                    "price": merged_metadata.price,
-                                    "uploader_address": merged_metadata.uploader_address,
                                     "http_sources": merged_metadata.http_sources,
                                     "ed2k_sources": merged_metadata.ed2k_sources,
                                 });
+                                
+                                info!("💰 DEBUG PUBLISH: DHT JSON uploaderAddress = {:?}", dht_metadata.get("uploaderAddress"));
 
                                 let record_key = kad::RecordKey::new(&merged_metadata.merkle_root.as_bytes());
 
@@ -1983,8 +2015,10 @@ async fn run_dht_node(
                                 info!("Successfully published and started providing encrypted file: {}", metadata.merkle_root);
                                 let _ = event_tx.send(DhtEvent::PublishedFile(metadata)).await;
                             }
-                            Some(DhtCommand::DownloadFile(mut file_metadata, download_path)) =>{
-                                info!("🎬 DownloadFile command received for: {} to: {}", file_metadata.file_name, download_path);
+                            Some(DhtCommand::DownloadFile { metadata, download_path, chunks_per_payment_batch }) =>{
+                                info!("🎬 DownloadFile command received for: {} to: {} (batch size: {})", 
+                                      metadata.file_name, download_path, chunks_per_payment_batch);
+                                let mut file_metadata = metadata;
                                 info!("🎬 file has cids: {:?}", file_metadata.cids);
                                 // Dual-lookup check: If the merkle_root is an info_hash, resolve it first.
                                 if file_metadata.merkle_root.starts_with("info_hash:") {
@@ -3112,13 +3146,78 @@ async fn run_dht_node(
                                                     Err(e) => {let _ = event_tx.send(DhtEvent::Error(e.to_string())).await; continue; }
                                                 };
 
+                                                // Calculate chunk size and total chunks
+                                                let total_chunks = cids.len() as u32;
+                                                
+                                                // Calculate price per chunk based on file price
+                                                let file_price = metadata.price;
+                                                let price_per_chunk = if total_chunks > 0 && file_price > 0.0 {
+                                                    file_price / (total_chunks as f64)
+                                                } else {
+                                                    0.0
+                                                };
+                                                
+                                                // Get chunks_per_payment_batch from the download context
+                                                // For now, use a default of 10 - this should be passed from frontend
+                                                let chunks_per_batch = 10u32; // TODO: Get from download settings
+                                                
+                                                info!("💰 PAYMENT INFO: File {} has {} chunks, price={} Chiral, price_per_chunk={} Chiral", 
+                                                      metadata.file_name, total_chunks, file_price, price_per_chunk);
+                                                info!("💰 PAYMENT INFO: Will process in batches of {} chunks", chunks_per_batch);
+                                                
+                                                // Calculate number of batches needed
+                                                let num_batches = (total_chunks + chunks_per_batch - 1) / chunks_per_batch;
+                                                info!("💰 PAYMENT INFO: Total {} batches needed for {} chunks", num_batches, total_chunks);
+                                                
+                                                // Get seeder's wallet address for payment (from metadata)
+                                                let seeder_address = metadata.uploader_address.clone();
+                                                info!("💰 PAYMENT INFO: Seeder wallet address: {:?}", seeder_address);
+                                                
+                                                if seeder_address.is_none() {
+                                                    warn!("⚠️ NO UPLOADER WALLET ADDRESS in metadata! The file was published without a wallet address.");
+                                                    warn!("⚠️ The seeder must re-upload this file while logged into their wallet to enable payments.");
+                                                    warn!("⚠️ Payments will be SKIPPED for this download.");
+                                                }
+                                                
+                                                // Emit payment required events for each batch BEFORE requesting chunks
+                                                for batch_num in 0..num_batches {
+                                                    let batch_start = batch_num * chunks_per_batch;
+                                                    let batch_end = std::cmp::min((batch_num + 1) * chunks_per_batch - 1, total_chunks - 1);
+                                                    let chunks_in_batch = batch_end - batch_start + 1;
+                                                    let batch_price = (chunks_in_batch as f64) * price_per_chunk;
+                                                    
+                                                    info!("💰 PAYMENT REQUIRED: Batch {}/{} - chunks {}-{} ({} chunks) = {} Chiral",
+                                                          batch_num + 1, num_batches, batch_start, batch_end, chunks_in_batch, batch_price);
+                                                    
+                                                    // Emit event to frontend for payment processing
+                                                    let send_result = event_tx.send(DhtEvent::ChunkBatchPaymentRequired {
+                                                        file_hash: metadata.merkle_root.clone(),
+                                                        file_name: metadata.file_name.clone(),
+                                                        seeder_address: seeder_address.clone(),
+                                                        batch_start_chunk: batch_start,
+                                                        batch_end_chunk: batch_end,
+                                                        total_chunks,
+                                                        price_per_chunk,
+                                                        total_batch_price: batch_price,
+                                                    }).await;
+                                                    
+                                                    match &send_result {
+                                                        Ok(_) => info!("💰 EVENT SENT: ChunkBatchPaymentRequired batch {} sent successfully!", batch_num + 1),
+                                                        Err(e) => error!("❌ EVENT SEND FAILED: ChunkBatchPaymentRequired batch {} failed: {:?}", batch_num + 1, e),
+                                                    }
+                                                }
+                                                
+                                                info!("💰 PAYMENT: All {} payment events emitted. Now requesting chunks...", num_batches);
+                                                
+                                                // Now request all chunks (in production, this should wait for payment confirmations)
                                                 for (i, cid) in cids.iter().enumerate() {
-                                                    // Request the root block which contains the CIDs
+                                                    // Request the block
                                                     let block_query_id = swarm.behaviour_mut().bitswap.get_from(&cid, peer_id);
                                                     file_queries.insert(block_query_id, i as u32);
                                                 }
+                                                
+                                                info!("📥 Requested {} chunks from seeder", cids.len());
 
-                                                // Calculate chunk size based on file size and number of chunks
                                                 let total_chunks = cids.len() as u64;
                                                 // assume 256kb
                                                 let chunk_size = 256 * 1024;
@@ -3609,7 +3708,7 @@ async fn run_dht_node(
                                                 trackers: json_val.get("trackers").and_then(|v| serde_json::from_value::<Option<Vec<String>>>(v.clone()).ok()).unwrap_or(None),
                                                 is_root: json_val.get("is_root").and_then(|v| v.as_bool()).unwrap_or(true),
                                                 price: json_val.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0),
-                                                uploader_address: json_val.get("uploader_address").and_then(|v| v.as_str()).map(|s| s.to_string()),
+                                                uploader_address: json_val.get("uploaderAddress").or_else(|| json_val.get("uploader_address")).and_then(|v| v.as_str()).map(|s| s.to_string()),
                                                 http_sources: json_val.get("httpSources").and_then(|v| {serde_json::from_value::<Option<Vec<HttpSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ed2k_sources: json_val.get("ed2kSources").and_then(|v| {serde_json::from_value::<Option<Vec<Ed2kSourceInfo>>>(v.clone()).unwrap_or(None)}),
                                                 ftp_sources: json_val.get("ftpSources").and_then(|v| {serde_json::from_value::<Option<Vec<FtpSourceInfo>>>(v.clone()).unwrap_or(None)}),
@@ -6870,6 +6969,8 @@ impl DhtService {
         mut metadata: FileMetadata,
         ftp_sources: Option<Vec<FtpSourceInfo>>,
     ) -> Result<(), String> {
+        info!("💰 DhtService::publish_file ENTRY - metadata.uploader_address = {:?}", metadata.uploader_address);
+        
         // Add FTP sources to metadata before publishing
         if let Some(sources) = ftp_sources {
             metadata.ftp_sources = Some(sources.into_iter().map(|s| s.for_dht_storage()).collect());
@@ -6880,10 +6981,16 @@ impl DhtService {
         {
             let mut cache = self.file_metadata_cache.lock().await;
             if let Some(existing) = cache.get(&metadata.merkle_root) {
+                info!("💰 DhtService::publish_file - MERGING with cached existing.uploader_address = {:?}", existing.uploader_address);
                 metadata = merge_file_metadata(existing.clone(), metadata);
+                info!("💰 DhtService::publish_file - AFTER MERGE metadata.uploader_address = {:?}", metadata.uploader_address);
+            } else {
+                info!("💰 DhtService::publish_file - NO CACHE, using as-is metadata.uploader_address = {:?}", metadata.uploader_address);
             }
             cache.insert(metadata.merkle_root.clone(), metadata.clone());
         }
+        
+        info!("💰 DhtService::publish_file - SENDING to cmd_tx with uploader_address = {:?}", metadata.uploader_address);
 
         let (response_tx, response_rx) = oneshot::channel();
 
@@ -6996,11 +7103,17 @@ impl DhtService {
         &self,
         file_metadata: FileMetadata,
         download_path: String,
+        chunks_per_payment_batch: u32,
     ) -> Result<(), String> {
-        info!("📥 DhtService::download_file called for: {} to: {}", file_metadata.file_name, download_path);
+        info!("📥 DhtService::download_file called for: {} to: {} (batch size: {})", 
+              file_metadata.file_name, download_path, chunks_per_payment_batch);
         info!("📥 file has {} seeders, cids present: {}", file_metadata.seeders.len(), file_metadata.cids.is_some());
         self.cmd_tx
-            .send(DhtCommand::DownloadFile(file_metadata, download_path))
+            .send(DhtCommand::DownloadFile {
+                metadata: file_metadata,
+                download_path,
+                chunks_per_payment_batch,
+            })
             .await
             .map_err(|e| e.to_string())
     }
