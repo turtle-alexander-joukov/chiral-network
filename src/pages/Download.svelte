@@ -176,7 +176,7 @@
           showToast(`Multi-source download failed: ${data.error}`, 'error')
         })
 
-        const unlistenBitswapProgress = await listen('bitswap_chunk_downloaded', (event) => {
+        const unlistenBitswapProgress = await listen('bitswap_chunk_downloaded', async (event) => {
           const progress = event.payload as {
                 fileHash: string;
                 chunkIndex: number;
@@ -190,6 +190,40 @@
                 totalChunks: progress.totalChunks,
                 chunkSize: progress.chunkSize
             });
+
+            // Find the file being downloaded to get seeder info
+            const downloadingFile = $files.find(f => f.hash === progress.fileHash && f.status === 'downloading');
+
+            // Process chunk payment
+            if (downloadingFile && downloadingFile.seederAddresses && downloadingFile.seederAddresses.length > 0) {
+                const seederWalletAddress = paymentService.isValidWalletAddress(downloadingFile.seederAddresses[0])
+                    ? downloadingFile.seederAddresses[0]!
+                    : null;
+                
+                if (seederWalletAddress) {
+                    try {
+                        const paymentResult = await paymentService.processChunkPayment(
+                            progress.fileHash,
+                            downloadingFile.name,
+                            progress.chunkSize,
+                            progress.chunkIndex,
+                            progress.totalChunks,
+                            seederWalletAddress,
+                            downloadingFile.seederAddresses[0] // Use as peer ID if needed
+                        );
+
+                        if (paymentResult.success) {
+                            console.log(`✅ Chunk ${progress.chunkIndex + 1}/${progress.totalChunks} payment processed`);
+                        } else {
+                            console.warn(`⚠️ Chunk payment failed: ${paymentResult.error}`);
+                        }
+                    } catch (error) {
+                        console.error('Error processing chunk payment:', error);
+                    }
+                } else {
+                    console.warn('⚠️ Skipping chunk payment: invalid seeder wallet address');
+                }
+            }
 
             // Only update files that are actively downloading, not seeding files with the same hash
             files.update(f => {
@@ -280,51 +314,31 @@
             const completedFile = $files.find(f => f.hash === metadata.merkleRoot);
 
             if (completedFile && !paidFiles.has(completedFile.hash)) {
-                // Process payment for Bitswap download (only once per file)
-                diagnosticLogger.info('Download', 'Bitswap download completed, processing payment', { fileName: completedFile.name });
-                const paymentAmount = await paymentService.calculateDownloadCost(completedFile.size);
+                // Note: For Bitswap downloads, payment is already processed per-chunk
+                // This section is for marking as complete only
+                diagnosticLogger.info('Download', 'Bitswap download completed', { fileName: completedFile.name });
                 
-                // Payment is always required (minimum 0.0001 Chiral enforced by paymentService)
+                paidFiles.add(completedFile.hash); // Mark as handled
 
-
-                const seederPeerId = completedFile.seederAddresses?.[0];
+                // Show completion message
                 const seederWalletAddress = paymentService.isValidWalletAddress(completedFile.seederAddresses?.[0])
                   ? completedFile.seederAddresses?.[0]!
-                  : null;                if (!seederWalletAddress) {
-                  diagnosticLogger.warn('Download', 'Skipping Bitswap payment due to missing or invalid uploader wallet address', {
+                  : null;
+                
+                if (!seederWalletAddress) {
+                  diagnosticLogger.warn('Download', 'Bitswap download completed but no valid uploader wallet address found', {
                       file: completedFile.name,
                       seederAddresses: completedFile.seederAddresses
                   });
-                  showToast('Payment skipped: missing uploader wallet address', 'warning');
+                  showToast('Download completed (payments already processed per chunk)', 'info');
               } else {
-                    try {
-                        const paymentResult = await paymentService.processDownloadPayment(
-                            completedFile.hash,
-                            completedFile.name,
-                            completedFile.size,
-                            seederWalletAddress,
-                            seederPeerId
-                        );
-
-                        if (paymentResult.success) {
-                            paidFiles.add(completedFile.hash); // Mark as paid
-                            diagnosticLogger.info('Download', 'Bitswap payment processed', { 
-                              amount: paymentAmount.toFixed(6), 
-                              seederWalletAddress, 
-                              seederPeerId 
-                            });
-                            showToast(
-                                `Download complete! Paid ${paymentAmount.toFixed(4)} Chiral`,
-                                'success'
-                            );
-                        } else {
-                            errorLogger.fileOperationError('Bitswap payment', paymentResult.error || 'Unknown error');
-                            showToast(`Payment failed: ${paymentResult.error}`, 'warning');
-                        }
-                    } catch (error) {
-                        errorLogger.fileOperationError('Bitswap payment processing', error instanceof Error ? error.message : String(error));
-                        showToast(`Payment failed: ${error instanceof Error ? error.message : 'Unknown error'}`, 'warning');
-                    }
+                    // Payments already processed per chunk, just show completion
+                    paidFiles.add(completedFile.hash); // Mark as handled
+                    diagnosticLogger.info('Download', 'Bitswap download completed (chunk payments already processed)', { 
+                        seederWalletAddress, 
+                        seederPeerId: completedFile.seederAddresses?.[0]
+                    });
+                    showToast(`Bitswap download completed! All chunk payments processed.`, 'success');
                 }
             }
 

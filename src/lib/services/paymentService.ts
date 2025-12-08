@@ -216,6 +216,230 @@ export class PaymentService {
   }
 
   /**
+   * Process payment for a single chunk download (for Bitswap)
+   * This deducts from the downloader's balance and creates a transaction
+   * @param fileHash - Hash of the file being downloaded
+   * @param fileName - Name of the file
+   * @param chunkSize - Size of the chunk in bytes
+   * @param chunkIndex - Index of the chunk
+   * @param totalChunks - Total number of chunks
+   * @param seederAddress - Wallet address of the seeder (0x...)
+   * @param seederPeerId - libp2p peer ID of the seeder
+   */
+  static async processChunkPayment(
+    fileHash: string,
+    fileName: string,
+    chunkSize: number,
+    chunkIndex: number,
+    totalChunks: number,
+    seederAddress: string,
+    seederPeerId?: string
+  ): Promise<{
+    success: boolean;
+    transactionId?: number;
+    transactionHash?: string;
+    error?: string;
+  }> {
+    try {
+      // Generate unique key for this chunk payment
+      const chunkKey = `${fileHash}-chunk-${chunkIndex}`;
+
+      // Check if this chunk has already been paid for
+      if (this.processedPayments.has(chunkKey)) {
+        console.log("⚠️ Payment already processed for chunk:", chunkKey);
+        return {
+          success: false,
+          error: "Payment already processed for this chunk",
+        };
+      }
+
+      // Calculate payment amount based on chunk size
+      const amount = await this.calculateDownloadCost(chunkSize);
+
+      if (!seederAddress || !this.WALLET_ADDRESS_REGEX.test(seederAddress)) {
+        console.error("❌ Invalid seeder wallet address for chunk payment", {
+          seederAddress,
+          fileName,
+          fileHash,
+          chunkIndex,
+        });
+        return {
+          success: false,
+          error: "Invalid seeder wallet address",
+        };
+      }
+
+      // Check if user has sufficient balance
+      if (!this.hasSufficientBalance(amount)) {
+        return {
+          success: false,
+          error: `Insufficient balance. Need ${amount.toFixed(4)} Chiral, have ${get(wallet).balance.toFixed(4)} Chiral`,
+        };
+      }
+
+      // Get current wallet state
+      const currentWallet = get(wallet);
+      const currentTransactions = get(transactions);
+      let transactionHash = "";
+
+      console.log("💰 Processing chunk payment:", {
+        currentBalance: currentWallet.balance,
+        amount,
+        fileName,
+        chunkIndex,
+        totalChunks,
+        seederAddress,
+        currentTransactionCount: currentTransactions.length,
+      });
+
+      try {
+        const result = await invoke<string>("process_download_payment", {
+          uploaderAddress: seederAddress,
+          price: amount,
+        });
+        if (!result || typeof result !== "string") {
+          throw new Error("Payment request did not return a transaction hash");
+        }
+        transactionHash = result;
+        console.log("🔗 On-chain chunk payment submitted:", {
+          transactionHash,
+          seederAddress,
+          amount,
+          chunkIndex,
+        });
+      } catch (chainError: any) {
+        const errorMessage =
+          chainError?.message ||
+          chainError?.toString() ||
+          "Failed to submit on-chain payment";
+        console.error("❌ Ethereum chunk payment transaction failed:", chainError);
+        return {
+          success: false,
+          error: errorMessage,
+        };
+      }
+
+      // Generate unique transaction ID
+      const transactionId =
+        currentTransactions.length > 0
+          ? Math.max(...currentTransactions.map((tx) => tx.id)) + 1
+          : 1;
+
+      // Deduct from downloader's balance
+      const newBalance = parseFloat(
+        (currentWallet.balance - amount).toFixed(8)
+      );
+      console.log("💸 Balance Update (Chunk):", {
+        before: currentWallet.balance,
+        deducting: amount,
+        after: newBalance,
+        chunkIndex,
+      });
+
+      wallet.update((w) => {
+        const updated = {
+          ...w,
+          balance: newBalance,
+        };
+        saveWalletToStorage(updated);
+        return updated;
+      });
+
+      // Create transaction record for chunk payment
+      const newTransaction: Transaction = {
+        id: transactionId,
+        type: "sent",
+        amount: amount,
+        to: seederAddress,
+        from: currentWallet.address,
+        txHash: transactionHash,
+        date: new Date(),
+        description: `Bitswap chunk ${chunkIndex + 1}/${totalChunks}: ${fileName}`,
+        status: "success",
+      };
+
+      console.log("📝 Creating chunk transaction:", newTransaction);
+
+      // Add transaction to history with persistence
+      transactions.update((txs) => {
+        const updated = [newTransaction, ...txs];
+        saveTransactionsToStorage(updated);
+        return updated;
+      });
+
+      // Mark this chunk as paid
+      this.processedPayments.add(chunkKey);
+      console.log("✅ Marked chunk as paid:", chunkKey);
+
+      // Publish reputation verdict for successful chunk payment
+      let downloaderPeerId = currentWallet.address;
+      try {
+        downloaderPeerId = await invoke<string>("get_peer_id");
+      } catch (err) {
+        console.warn(
+          "Could not get peer ID for issuer_id, using wallet address:",
+          err
+        );
+      }
+
+      try {
+        await reputationService.publishVerdict({
+          target_id: seederPeerId || seederAddress,
+          tx_hash: transactionHash,
+          outcome: "good",
+          details: `Chunk ${chunkIndex + 1}/${totalChunks} payment for file: ${fileName}`,
+          metric: "transaction",
+          issued_at: Math.floor(Date.now() / 1000),
+          issuer_id: downloaderPeerId,
+          issuer_seq_no: transactionId,
+        });
+
+        console.log(
+          "✅ Published good reputation verdict for chunk seeder:",
+          seederPeerId || seederAddress
+        );
+      } catch (reputationError) {
+        console.error(
+          "❌ Failed to publish reputation verdict:",
+          reputationError
+        );
+      }
+
+      // Notify backend about the chunk payment
+      try {
+        await invoke("record_download_payment", {
+          fileHash,
+          fileName,
+          fileSize: chunkSize,
+          seederWalletAddress: seederAddress,
+          seederPeerId: seederPeerId || seederAddress,
+          downloaderAddress: currentWallet.address || "unknown",
+          downloaderPeerId,
+          amount,
+          transactionId,
+          transactionHash,
+        });
+        console.log("✅ Chunk payment notification sent to seeder:", seederAddress);
+      } catch (invokeError) {
+        console.warn("Failed to send chunk payment notification:", invokeError);
+      }
+
+      return {
+        success: true,
+        transactionId,
+        transactionHash,
+      };
+    } catch (error) {
+      console.error("Error processing chunk payment:", error);
+      return {
+        success: false,
+        error:
+          error instanceof Error ? error.message : "Unknown error occurred",
+      };
+    }
+  }
+
+  /**
    * Process payment for a file download
    * This deducts from the downloader's balance and creates a transaction
    * @param seederAddress - Wallet address of the seeder (0x...)

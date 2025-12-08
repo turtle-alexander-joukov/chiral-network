@@ -473,9 +473,7 @@
           <li class="flex items-center justify-between">
             <span class="text-muted-foreground">Price</span>
             <span class="font-semibold text-emerald-600">
-              {#if isSeeding}
-                Free
-              {:else if checkingBalance}
+              {#if checkingBalance}
                 Calculating...
               {:else if currentPrice !== null}
                 {currentPrice.toFixed(4)} Chiral
@@ -617,7 +615,7 @@
 
       <p class="text-sm text-muted-foreground text-center mb-6">
         {isSeeding
-          ? `Download a local copy for free (you're already seeding this file)`
+          ? `Download a local copy for ${(currentPrice ?? 0.0001).toFixed(4)} Chiral (you're already seeding this file)`
           : `You will be charged ${(currentPrice ?? 0.0001).toFixed(4)} Chiral. Continue?`}
       </p>
 
