@@ -216,24 +216,22 @@ export class PaymentService {
   }
 
   /**
-   * Process payment for a single chunk download (for Bitswap)
-   * This deducts from the downloader's balance and creates a transaction
+   * Process batched payment for multiple chunks (for Bitswap)
+   * This batches chunk payments to avoid nonce conflicts on the blockchain
    * @param fileHash - Hash of the file being downloaded
    * @param fileName - Name of the file
-   * @param chunkSize - Size of the chunk in bytes
-   * @param chunkIndex - Index of the chunk
-   * @param totalChunks - Total number of chunks
+   * @param totalBytes - Total bytes in this batch
+   * @param chunkIndices - Array of chunk indices in this batch
+   * @param totalChunks - Total number of chunks in the file
    * @param seederAddress - Wallet address of the seeder (0x...)
-   * @param seederPeerId - libp2p peer ID of the seeder
    */
-  static async processChunkPayment(
+  static async processBatchedChunkPayment(
     fileHash: string,
     fileName: string,
-    chunkSize: number,
-    chunkIndex: number,
+    totalBytes: number,
+    chunkIndices: number[],
     totalChunks: number,
-    seederAddress: string,
-    seederPeerId?: string
+    seederAddress: string
   ): Promise<{
     success: boolean;
     transactionId?: number;
@@ -241,27 +239,27 @@ export class PaymentService {
     error?: string;
   }> {
     try {
-      // Generate unique key for this chunk payment
-      const chunkKey = `${fileHash}-chunk-${chunkIndex}`;
+      // Generate unique key for this batch payment
+      const batchKey = `${fileHash}-batch-${chunkIndices.join(',')}`;
 
-      // Check if this chunk has already been paid for
-      if (this.processedPayments.has(chunkKey)) {
-        console.log("⚠️ Payment already processed for chunk:", chunkKey);
+      // Check if this batch has already been paid for
+      if (this.processedPayments.has(batchKey)) {
+        console.log("⚠️ Payment already processed for batch:", batchKey);
         return {
           success: false,
-          error: "Payment already processed for this chunk",
+          error: "Payment already processed for this batch",
         };
       }
 
-      // Calculate payment amount based on chunk size
-      const amount = await this.calculateDownloadCost(chunkSize);
+      // Calculate payment amount based on total bytes in batch
+      const amount = await this.calculateDownloadCost(totalBytes);
 
       if (!seederAddress || !this.WALLET_ADDRESS_REGEX.test(seederAddress)) {
-        console.error("❌ Invalid seeder wallet address for chunk payment", {
+        console.error("❌ Invalid seeder wallet address for batched payment", {
           seederAddress,
           fileName,
           fileHash,
-          chunkIndex,
+          chunkCount: chunkIndices.length,
         });
         return {
           success: false,
@@ -282,14 +280,16 @@ export class PaymentService {
       const currentTransactions = get(transactions);
       let transactionHash = "";
 
-      console.log("💰 Processing chunk payment:", {
+      const minChunk = Math.min(...chunkIndices) + 1;
+      const maxChunk = Math.max(...chunkIndices) + 1;
+
+      console.log("💰 Processing batched chunk payment:", {
         currentBalance: currentWallet.balance,
         amount,
         fileName,
-        chunkIndex,
-        totalChunks,
+        chunkCount: chunkIndices.length,
+        chunkRange: `${minChunk}-${maxChunk}/${totalChunks}`,
         seederAddress,
-        currentTransactionCount: currentTransactions.length,
       });
 
       try {
@@ -301,18 +301,18 @@ export class PaymentService {
           throw new Error("Payment request did not return a transaction hash");
         }
         transactionHash = result;
-        console.log("🔗 On-chain chunk payment submitted:", {
+        console.log("🔗 On-chain batched payment submitted:", {
           transactionHash,
           seederAddress,
           amount,
-          chunkIndex,
+          chunkCount: chunkIndices.length,
         });
       } catch (chainError: any) {
         const errorMessage =
           chainError?.message ||
           chainError?.toString() ||
           "Failed to submit on-chain payment";
-        console.error("❌ Ethereum chunk payment transaction failed:", chainError);
+        console.error("❌ Ethereum batched payment transaction failed:", chainError);
         return {
           success: false,
           error: errorMessage,
@@ -329,12 +329,6 @@ export class PaymentService {
       const newBalance = parseFloat(
         (currentWallet.balance - amount).toFixed(8)
       );
-      console.log("💸 Balance Update (Chunk):", {
-        before: currentWallet.balance,
-        deducting: amount,
-        after: newBalance,
-        chunkIndex,
-      });
 
       wallet.update((w) => {
         const updated = {
@@ -345,7 +339,11 @@ export class PaymentService {
         return updated;
       });
 
-      // Create transaction record for chunk payment
+      // Create transaction record for batched chunk payment
+      const chunkDescription = chunkIndices.length === 1 
+        ? `Bitswap chunk ${minChunk}/${totalChunks}` 
+        : `Bitswap chunks ${minChunk}-${maxChunk}/${totalChunks}`;
+      
       const newTransaction: Transaction = {
         id: transactionId,
         type: "sent",
@@ -354,11 +352,11 @@ export class PaymentService {
         from: currentWallet.address,
         txHash: transactionHash,
         date: new Date(),
-        description: `Bitswap chunk ${chunkIndex + 1}/${totalChunks}: ${fileName}`,
+        description: `${chunkDescription}: ${fileName}`,
         status: "success",
       };
 
-      console.log("📝 Creating chunk transaction:", newTransaction);
+      console.log("📝 Creating batched chunk transaction:", newTransaction);
 
       // Add transaction to history with persistence
       transactions.update((txs) => {
@@ -367,11 +365,14 @@ export class PaymentService {
         return updated;
       });
 
-      // Mark this chunk as paid
-      this.processedPayments.add(chunkKey);
-      console.log("✅ Marked chunk as paid:", chunkKey);
+      // Mark this batch as paid
+      this.processedPayments.add(batchKey);
+      // Also mark individual chunks to prevent double-payment
+      for (const idx of chunkIndices) {
+        this.processedPayments.add(`${fileHash}-chunk-${idx}`);
+      }
 
-      // Publish reputation verdict for successful chunk payment
+      // Publish reputation verdict for successful payment
       let downloaderPeerId = currentWallet.address;
       try {
         downloaderPeerId = await invoke<string>("get_peer_id");
@@ -384,10 +385,10 @@ export class PaymentService {
 
       try {
         await reputationService.publishVerdict({
-          target_id: seederPeerId || seederAddress,
+          target_id: seederAddress,
           tx_hash: transactionHash,
           outcome: "good",
-          details: `Chunk ${chunkIndex + 1}/${totalChunks} payment for file: ${fileName}`,
+          details: `${chunkDescription} payment for file: ${fileName}`,
           metric: "transaction",
           issued_at: Math.floor(Date.now() / 1000),
           issuer_id: downloaderPeerId,
@@ -395,8 +396,8 @@ export class PaymentService {
         });
 
         console.log(
-          "✅ Published good reputation verdict for chunk seeder:",
-          seederPeerId || seederAddress
+          "✅ Published good reputation verdict for batched payment to:",
+          seederAddress
         );
       } catch (reputationError) {
         console.error(
@@ -405,23 +406,23 @@ export class PaymentService {
         );
       }
 
-      // Notify backend about the chunk payment
+      // Notify backend about the payment
       try {
         await invoke("record_download_payment", {
           fileHash,
           fileName,
-          fileSize: chunkSize,
+          fileSize: totalBytes,
           seederWalletAddress: seederAddress,
-          seederPeerId: seederPeerId || seederAddress,
+          seederPeerId: seederAddress,
           downloaderAddress: currentWallet.address || "unknown",
           downloaderPeerId,
           amount,
           transactionId,
           transactionHash,
         });
-        console.log("✅ Chunk payment notification sent to seeder:", seederAddress);
+        console.log("✅ Batched payment notification sent to seeder:", seederAddress);
       } catch (invokeError) {
-        console.warn("Failed to send chunk payment notification:", invokeError);
+        console.warn("Failed to send batched payment notification:", invokeError);
       }
 
       return {
@@ -430,7 +431,7 @@ export class PaymentService {
         transactionHash,
       };
     } catch (error) {
-      console.error("Error processing chunk payment:", error);
+      console.error("Error processing batched chunk payment:", error);
       return {
         success: false,
         error:

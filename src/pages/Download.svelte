@@ -176,6 +176,19 @@
           showToast(`Multi-source download failed: ${data.error}`, 'error')
         })
 
+        // Track pending chunk payments per file for batching
+        const pendingChunkPayments = new Map<string, { 
+            chunks: number[], 
+            totalBytes: number, 
+            lastPaymentTime: number,
+            uploaderAddress: string,
+            fileName: string
+        }>();
+        
+        // Payment batch settings
+        const PAYMENT_BATCH_SIZE = 5; // Pay after every N chunks
+        const PAYMENT_MIN_INTERVAL_MS = 3000; // Minimum 3 seconds between payments
+        
         const unlistenBitswapProgress = await listen('bitswap_chunk_downloaded', async (event) => {
           const progress = event.payload as {
                 fileHash: string;
@@ -194,57 +207,68 @@
             // Find the file being downloaded to get seeder info
             const downloadingFile = $files.find(f => f.hash === progress.fileHash && f.status === 'downloading');
             
-            console.log('🔍 Chunk payment debug:', {
-                downloadingFile: downloadingFile ? {
-                    name: downloadingFile.name,
-                    hash: downloadingFile.hash,
-                    uploaderAddress: downloadingFile.uploaderAddress,
-                    status: downloadingFile.status
-                } : null
-            });
-
-            // Process chunk payment using uploaderAddress (wallet address of the file owner)
+            // Track chunk for batched payment
             if (downloadingFile && downloadingFile.uploaderAddress) {
                 const seederWalletAddress = paymentService.isValidWalletAddress(downloadingFile.uploaderAddress)
                     ? downloadingFile.uploaderAddress
                     : null;
                 
-                console.log('💰 Attempting chunk payment:', {
-                    chunkIndex: progress.chunkIndex,
-                    seederWalletAddress,
-                    isValid: !!seederWalletAddress
-                });
-                
                 if (seederWalletAddress) {
-                    try {
-                        const paymentResult = await paymentService.processChunkPayment(
-                            progress.fileHash,
-                            downloadingFile.name,
-                            progress.chunkSize,
-                            progress.chunkIndex,
-                            progress.totalChunks,
-                            seederWalletAddress,
-                            seederWalletAddress // Use wallet address for reputation tracking
-                        );
-
-                        if (paymentResult.success) {
-                            console.log(`✅ Chunk ${progress.chunkIndex + 1}/${progress.totalChunks} payment processed, txHash: ${paymentResult.transactionHash}`);
-                        } else {
-                            console.error(`❌ Chunk payment failed: ${paymentResult.error}`);
-                            showToast(`Chunk payment failed: ${paymentResult.error}`, 'error');
-                        }
-                    } catch (error) {
-                        console.error('💥 Exception processing chunk payment:', error);
-                        showToast(`Chunk payment error: ${error}`, 'error');
+                    // Initialize or update pending payments for this file
+                    if (!pendingChunkPayments.has(progress.fileHash)) {
+                        pendingChunkPayments.set(progress.fileHash, {
+                            chunks: [],
+                            totalBytes: 0,
+                            lastPaymentTime: 0,
+                            uploaderAddress: seederWalletAddress,
+                            fileName: downloadingFile.name
+                        });
                     }
-                } else {
-                    console.warn('⚠️ Skipping chunk payment: invalid uploader wallet address', downloadingFile.uploaderAddress);
+                    
+                    const pending = pendingChunkPayments.get(progress.fileHash)!;
+                    
+                    // Only add if not already tracked
+                    if (!pending.chunks.includes(progress.chunkIndex)) {
+                        pending.chunks.push(progress.chunkIndex);
+                        pending.totalBytes += progress.chunkSize;
+                    }
+                    
+                    const now = Date.now();
+                    const timeSinceLastPayment = now - pending.lastPaymentTime;
+                    const isLastChunk = progress.chunkIndex === progress.totalChunks - 1 || 
+                                       pending.chunks.length >= progress.totalChunks;
+                    const shouldPayNow = pending.chunks.length >= PAYMENT_BATCH_SIZE || 
+                                        (timeSinceLastPayment >= PAYMENT_MIN_INTERVAL_MS && pending.chunks.length > 0) ||
+                                        isLastChunk;
+                    
+                    if (shouldPayNow && pending.totalBytes > 0) {
+                        console.log(`💰 Processing batched payment for ${pending.chunks.length} chunks (${pending.totalBytes} bytes)`);
+                        
+                        try {
+                            const paymentResult = await paymentService.processBatchedChunkPayment(
+                                progress.fileHash,
+                                pending.fileName,
+                                pending.totalBytes,
+                                pending.chunks,
+                                progress.totalChunks,
+                                pending.uploaderAddress
+                            );
+
+                            if (paymentResult.success) {
+                                console.log(`✅ Batched payment for ${pending.chunks.length} chunks processed, txHash: ${paymentResult.transactionHash}`);
+                                // Reset pending after successful payment
+                                pending.chunks = [];
+                                pending.totalBytes = 0;
+                                pending.lastPaymentTime = now;
+                            } else {
+                                console.error(`❌ Batched chunk payment failed: ${paymentResult.error}`);
+                                // Don't show toast for every failure, just log
+                            }
+                        } catch (error) {
+                            console.error('💥 Exception processing batched chunk payment:', error);
+                        }
+                    }
                 }
-            } else {
-                console.warn('⚠️ Skipping chunk payment: no downloading file or uploader address', {
-                    hasFile: !!downloadingFile,
-                    uploaderAddress: downloadingFile?.uploaderAddress
-                });
             }
 
             // Only update files that are actively downloading, not seeding files with the same hash
