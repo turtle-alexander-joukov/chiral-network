@@ -37,6 +37,36 @@
 
   const tr = (k: string, params?: Record<string, any>) => $t(k, params)
 
+  // Helper function to wait for a transaction to be mined on the blockchain
+  async function waitForTransactionMined(txHash: string, maxWaitMs: number = 120000): Promise<boolean> {
+    const pollIntervalMs = 2000; // Check every 2 seconds
+    const startTime = Date.now();
+    
+    console.log(`⏳ Polling for transaction ${txHash} to be mined (max wait: ${maxWaitMs / 1000}s)...`);
+    
+    while (Date.now() - startTime < maxWaitMs) {
+      try {
+        const receipt = await invoke<any>('get_transaction_by_hash', { txHash });
+        
+        if (receipt && receipt.blockNumber) {
+          console.log(`✅ Transaction ${txHash} mined in block ${receipt.blockNumber}`);
+          return true;
+        }
+        
+        // Transaction exists but not yet mined
+        console.log(`⏳ Transaction ${txHash} pending... (elapsed: ${Math.round((Date.now() - startTime) / 1000)}s)`);
+      } catch (error) {
+        // Transaction might not be found yet, keep waiting
+        console.log(`⏳ Transaction ${txHash} not found yet, retrying...`);
+      }
+      
+      await new Promise(resolve => setTimeout(resolve, pollIntervalMs));
+    }
+    
+    console.error(`❌ Timeout waiting for transaction ${txHash} to be mined`);
+    return false;
+  }
+
  // Auto-detect protocol based on file metadata
   let detectedProtocol: 'WebRTC' | 'Bitswap' | undefined = undefined
   let torrentDownloads = new Map<string, any>();
@@ -274,6 +304,8 @@
                 fileHash: string;
                 fileName: string;
                 seederAddress: string | null;
+                seederPeerId: string;
+                batchNum: number;
                 batchStartChunk: number;
                 batchEndChunk: number;
                 totalChunks: number;
@@ -287,17 +319,19 @@
             diagnosticLogger.info('Download', 'Chunk batch payment required', {
                 fileHash: paymentInfo.fileHash,
                 fileName: paymentInfo.fileName,
+                batchNum: paymentInfo.batchNum,
                 batch: `${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}`,
                 totalChunks: paymentInfo.totalChunks,
                 pricePerChunk: paymentInfo.pricePerChunk,
                 totalBatchPrice: paymentInfo.totalBatchPrice,
-                seederAddress: paymentInfo.seederAddress
+                seederAddress: paymentInfo.seederAddress,
+                seederPeerId: paymentInfo.seederPeerId
             });
 
             // Process payment if seeder has a valid wallet address
             if (paymentInfo.seederAddress && paymentInfo.totalBatchPrice > 0) {
                 try {
-                    console.log(`💰 Processing prepayment for batch ${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}: ${paymentInfo.totalBatchPrice} Chiral to ${paymentInfo.seederAddress}`);
+                    console.log(`💰 Processing prepayment for batch ${paymentInfo.batchNum} (${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}): ${paymentInfo.totalBatchPrice} Chiral to ${paymentInfo.seederAddress}`);
                     
                     const result = await paymentService.processChunkBatchPayment(
                         paymentInfo.fileHash,
@@ -308,10 +342,11 @@
                         paymentInfo.pricePerChunk
                     );
 
-                    if (result.success) {
-                        console.log(`✅ Chunk batch payment SUCCESS: tx=${result.transactionHash}`);
-                        diagnosticLogger.info('Download', 'Chunk batch payment processed', {
+                    if (result.success && result.transactionHash) {
+                        console.log(`✅ Chunk batch payment SUBMITTED: tx=${result.transactionHash}`);
+                        diagnosticLogger.info('Download', 'Chunk batch payment submitted', {
                             txHash: result.transactionHash,
+                            batchNum: paymentInfo.batchNum,
                             batch: `${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}`,
                             amount: paymentInfo.totalBatchPrice
                         });
@@ -334,8 +369,8 @@
                                 to: paymentInfo.seederAddress, // seeder address
                                 txHash: result.transactionHash,
                                 date: new Date(),
-                                description: `Upload payment: ${paymentInfo.fileName} (batch ${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk})`,
-                                status: 'success'
+                                description: `Upload payment: ${paymentInfo.fileName} (batch ${paymentInfo.batchNum})`,
+                                status: 'pending' // Mark as pending until mined
                             };
                             
                             transactions.update((txs: Transaction[]) => {
@@ -348,18 +383,78 @@
                                 }
                                 return updated;
                             });
-                            console.log(`✅ Seeder credit recorded for batch ${paymentInfo.batchStartChunk}-${paymentInfo.batchEndChunk}: +${paymentInfo.totalBatchPrice} Chiral`);
+                            console.log(`✅ Seeder credit recorded (pending) for batch ${paymentInfo.batchNum}: +${paymentInfo.totalBatchPrice} Chiral`);
+                        }
+                        
+                        // Wait for the transaction to be mined before confirming to backend
+                        console.log(`⏳ Waiting for transaction ${result.transactionHash} to be mined...`);
+                        showToast(`Batch ${paymentInfo.batchNum}: Waiting for blockchain confirmation...`, 'info');
+                        
+                        const mined = await waitForTransactionMined(result.transactionHash);
+                        
+                        if (mined) {
+                            console.log(`✅ Transaction ${result.transactionHash} MINED! Confirming batch payment...`);
+                            
+                            // Update transaction status to success
+                            transactions.update((txs: Transaction[]) => {
+                                return txs.map(tx => {
+                                    if (tx.txHash === result.transactionHash) {
+                                        return { ...tx, status: 'success' as const };
+                                    }
+                                    return tx;
+                                });
+                            });
+                            
+                            // Confirm payment to backend - this triggers chunk downloads
+                            try {
+                                await invoke('confirm_batch_payment', {
+                                    fileHash: paymentInfo.fileHash,
+                                    batchNum: paymentInfo.batchNum,
+                                    txHash: result.transactionHash
+                                });
+                                console.log(`✅ Backend notified of payment confirmation for batch ${paymentInfo.batchNum}`);
+                                showToast(`Batch ${paymentInfo.batchNum}: Payment confirmed, downloading chunks...`, 'success');
+                            } catch (confirmError) {
+                                console.error(`❌ Failed to confirm batch payment to backend:`, confirmError);
+                                showToast(`Failed to confirm batch ${paymentInfo.batchNum} payment`, 'error');
+                            }
+                        } else {
+                            console.error(`❌ Transaction ${result.transactionHash} failed to mine within timeout`);
+                            showToast(`Batch ${paymentInfo.batchNum}: Payment transaction failed`, 'error');
+                            
+                            // Update transaction status to failed
+                            transactions.update((txs: Transaction[]) => {
+                                return txs.map(tx => {
+                                    if (tx.txHash === result.transactionHash) {
+                                        return { ...tx, status: 'failed' as const };
+                                    }
+                                    return tx;
+                                });
+                            });
                         }
                     } else {
                         console.error(`❌ Chunk batch payment FAILED: ${result.error}`);
                         errorLogger.fileOperationError('Chunk batch payment', result.error || 'Unknown error');
+                        showToast(`Batch ${paymentInfo.batchNum}: Payment failed - ${result.error}`, 'error');
                     }
                 } catch (error) {
                     console.error('❌ Chunk batch payment ERROR:', error);
                     errorLogger.fileOperationError('Chunk batch payment', error instanceof Error ? error.message : String(error));
+                    showToast(`Batch ${paymentInfo.batchNum}: Payment error`, 'error');
                 }
             } else {
                 console.log('⚠️ Skipping payment: No valid seeder address or zero price');
+                // Still need to confirm to backend so chunks can be requested (free download)
+                try {
+                    await invoke('confirm_batch_payment', {
+                        fileHash: paymentInfo.fileHash,
+                        batchNum: paymentInfo.batchNum,
+                        txHash: 'free_download'
+                    });
+                    console.log(`✅ Free download: Backend notified for batch ${paymentInfo.batchNum}`);
+                } catch (confirmError) {
+                    console.error(`❌ Failed to confirm free batch to backend:`, confirmError);
+                }
             }
         });
 

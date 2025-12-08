@@ -1924,17 +1924,73 @@ async fn start_dht_node(
                     file_hash,
                     file_name,
                     seeder_address,
+                    seeder_peer_id,
+                    batch_num,
                     batch_start_chunk,
                     batch_end_chunk,
                     total_chunks,
                     price_per_chunk,
                     total_batch_price,
                 } => {
-                    // Note: This event is handled by pump_dht_events function, not here
-                    // to avoid duplicate payment processing
                     info!(
-                        "💰 EVENT PUMP1 (skip): ChunkBatchPaymentRequired for file={}, batch {}-{}/{}",
-                        file_name, batch_start_chunk, batch_end_chunk, total_chunks
+                        "💰 CHUNK BATCH PAYMENT REQUIRED: file={}, batch {} ({}-{})/{}",
+                        file_name, batch_num, batch_start_chunk, batch_end_chunk, total_chunks
+                    );
+                    // Emit event to frontend for payment processing
+                    let payload = serde_json::json!({
+                        "fileHash": file_hash,
+                        "fileName": file_name,
+                        "seederAddress": seeder_address,
+                        "seederPeerId": seeder_peer_id,
+                        "batchNum": batch_num,
+                        "batchStartChunk": batch_start_chunk,
+                        "batchEndChunk": batch_end_chunk,
+                        "totalChunks": total_chunks,
+                        "pricePerChunk": price_per_chunk,
+                        "totalBatchPrice": total_batch_price,
+                    });
+                    let _ = app_handle.emit("chunk_batch_payment_required", payload);
+                }
+                DhtEvent::ChunkBatchPaymentConfirmed {
+                    file_hash,
+                    batch_num,
+                    tx_hash,
+                } => {
+                    info!(
+                        "💰 CHUNK BATCH PAYMENT CONFIRMED: file={}, batch={}, tx={}",
+                        file_hash, batch_num, tx_hash
+                    );
+                    let payload = serde_json::json!({
+                        "fileHash": file_hash,
+                        "batchNum": batch_num,
+                        "txHash": tx_hash,
+                    });
+                    let _ = app_handle.emit("chunk_batch_payment_confirmed", payload);
+                }
+                DhtEvent::PaymentReceivedFromBuyer {
+                    file_hash,
+                    buyer_peer_id,
+                    batch_num,
+                    tx_hash,
+                    amount,
+                } => {
+                    info!(
+                        "💰 PAYMENT RECEIVED FROM BUYER: file={}, batch={}, amount={} Chiral, buyer={}",
+                        file_hash, batch_num, amount, buyer_peer_id
+                    );
+                    let payload = serde_json::json!({
+                        "fileHash": file_hash,
+                        "buyerPeerId": buyer_peer_id,
+                        "batchNum": batch_num,
+                        "txHash": tx_hash,
+                        "amount": amount,
+                    });
+                    let _ = app_handle.emit("payment_received_from_buyer", payload);
+                }
+                DhtEvent::RequestBatchDownload { file_hash, batch_num } => {
+                    info!(
+                        "💰 REQUEST BATCH DOWNLOAD: file={}, batch={}",
+                        file_hash, batch_num
                     );
                 }
                     _ => {}
@@ -2253,7 +2309,7 @@ async fn get_dht_health(state: State<'_, AppState>) -> Result<Option<DhtMetricsS
 }
 
 #[tauri::command]
-async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, String> {
+async fn get_dht_events(state: State<'_, AppState>, app: tauri::AppHandle) -> Result<Vec<String>, String> {
     let dht = {
         let dht_guard = state.dht.lock().await;
         dht_guard.as_ref().cloned()
@@ -2262,9 +2318,43 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
     if let Some(dht) = dht {
         let events = dht.drain_events(100).await;
         // Convert events to concise human-readable strings for the UI
+        // Also emit critical events like payment requests to frontend
         let mapped: Vec<String> = events
             .into_iter()
-            .map(|e| match e {
+            .map(|e| {
+                // Emit payment events to frontend
+                match &e {
+                    DhtEvent::ChunkBatchPaymentRequired {
+                        file_hash,
+                        file_name,
+                        seeder_address,
+                        seeder_peer_id,
+                        batch_num,
+                        batch_start_chunk,
+                        batch_end_chunk,
+                        total_chunks,
+                        price_per_chunk,
+                        total_batch_price,
+                    } => {
+                        info!("💰 GET_DHT_EVENTS: Emitting chunk_batch_payment_required for batch {}", batch_num);
+                        let payload = serde_json::json!({
+                            "fileHash": file_hash,
+                            "fileName": file_name,
+                            "seederAddress": seeder_address,
+                            "seederPeerId": seeder_peer_id,
+                            "batchNum": batch_num,
+                            "batchStartChunk": batch_start_chunk,
+                            "batchEndChunk": batch_end_chunk,
+                            "totalChunks": total_chunks,
+                            "pricePerChunk": price_per_chunk,
+                            "totalBatchPrice": total_batch_price,
+                        });
+                        let _ = app.emit("chunk_batch_payment_required", payload);
+                    }
+                    _ => {}
+                }
+                
+                match e {
                 // DhtEvent::PeerDiscovered(p) => format!("peer_discovered:{}", p),
                 // DhtEvent::PeerConnected(p) => format!("peer_connected:{}", p),
                 // DhtEvent::PeerDisconnected(p) => format!("peer_disconnected:{}", p),
@@ -2381,6 +2471,8 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                     file_hash,
                     file_name,
                     seeder_address,
+                    seeder_peer_id,
+                    batch_num,
                     batch_start_chunk,
                     batch_end_chunk,
                     total_chunks,
@@ -2388,17 +2480,44 @@ async fn get_dht_events(state: State<'_, AppState>) -> Result<Vec<String>, Strin
                     total_batch_price,
                 } => {
                     format!(
-                        "chunk_batch_payment_required:{}:{}:{}:{}-{}:{}:{}",
+                        "chunk_batch_payment_required:{}:{}:{}:{}:{}:{}-{}:{}:{}",
                         file_hash,
                         file_name,
                         seeder_address.unwrap_or_default(),
+                        seeder_peer_id,
+                        batch_num,
                         batch_start_chunk,
                         batch_end_chunk,
                         total_chunks,
                         total_batch_price
                     )
                 }
-            })
+                DhtEvent::ChunkBatchPaymentConfirmed {
+                    file_hash,
+                    batch_num,
+                    tx_hash,
+                } => {
+                    format!(
+                        "chunk_batch_payment_confirmed:{}:{}:{}",
+                        file_hash, batch_num, tx_hash
+                    )
+                }
+                DhtEvent::PaymentReceivedFromBuyer {
+                    file_hash,
+                    buyer_peer_id,
+                    batch_num,
+                    tx_hash,
+                    amount,
+                } => {
+                    format!(
+                        "payment_received_from_buyer:{}:{}:{}:{}:{}",
+                        file_hash, buyer_peer_id, batch_num, tx_hash, amount
+                    )
+                }
+                DhtEvent::RequestBatchDownload { file_hash, batch_num } => {
+                    format!("request_batch_download:{}:{}", file_hash, batch_num)
+                }
+            }})
             .collect();
         Ok(mapped)
     } else {
@@ -4709,6 +4828,29 @@ async fn download_blocks_from_network(
         dht.download_file(file_metadata, download_path, batch_size).await
     } else {
         error!("🔽 DHT node is not running!");
+        Err("DHT node is not running".to_string())
+    }
+}
+
+/// Confirm a batch payment after blockchain verification
+/// This triggers the DHT to request chunks for the confirmed batch
+#[tauri::command]
+async fn confirm_batch_payment(
+    state: State<'_, AppState>,
+    file_hash: String,
+    batch_num: u32,
+    tx_hash: String,
+) -> Result<(), String> {
+    info!("💰 confirm_batch_payment called: file={}, batch={}, tx={}", file_hash, batch_num, tx_hash);
+    
+    let dht = {
+        let dht_guard = state.dht.lock().await;
+        dht_guard.as_ref().cloned()
+    };
+
+    if let Some(dht) = dht {
+        dht.confirm_batch_payment(file_hash, batch_num, tx_hash).await
+    } else {
         Err("DHT node is not running".to_string())
     }
 }
@@ -7987,6 +8129,7 @@ fn main() {
             upload_file_to_network,
             start_ftp_download,
             download_blocks_from_network,
+            confirm_batch_payment,
             start_multi_source_download,
             cancel_multi_source_download,
             get_multi_source_progress,
@@ -9179,6 +9322,8 @@ async fn pump_dht_events(
                     file_hash,
                     file_name,
                     seeder_address,
+                    seeder_peer_id,
+                    batch_num,
                     batch_start_chunk,
                     batch_end_chunk,
                     total_chunks,
@@ -9186,13 +9331,15 @@ async fn pump_dht_events(
                     total_batch_price,
                 } => {
                     info!(
-                        "💰 PUMP2: CHUNK BATCH PAYMENT REQUIRED! file={}, batch {}-{}/{}, price={} Chiral",
-                        file_name, batch_start_chunk, batch_end_chunk, total_chunks, total_batch_price
+                        "💰 PUMP2: Emitting chunk_batch_payment_required to frontend! file={}, batch {} ({}-{})/{}",
+                        file_name, batch_num, batch_start_chunk, batch_end_chunk, total_chunks
                     );
                     let payload = serde_json::json!({
                         "fileHash": file_hash,
                         "fileName": file_name,
                         "seederAddress": seeder_address,
+                        "seederPeerId": seeder_peer_id,
+                        "batchNum": batch_num,
                         "batchStartChunk": batch_start_chunk,
                         "batchEndChunk": batch_end_chunk,
                         "totalChunks": total_chunks,
@@ -9200,6 +9347,15 @@ async fn pump_dht_events(
                         "totalBatchPrice": total_batch_price,
                     });
                     let _ = app_handle.emit("chunk_batch_payment_required", payload);
+                }
+                DhtEvent::ChunkBatchPaymentConfirmed { .. } => {
+                    // Handled by first pump
+                }
+                DhtEvent::PaymentReceivedFromBuyer { .. } => {
+                    // Handled by first pump
+                }
+                DhtEvent::RequestBatchDownload { .. } => {
+                    // Handled by first pump
                 }
                 _ => {}
             }

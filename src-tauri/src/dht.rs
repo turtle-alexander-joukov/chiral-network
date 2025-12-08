@@ -322,7 +322,116 @@ struct DhtBehaviour {
     dcutr: toggle::Toggle<dcutr::Behaviour>,
     upnp: toggle::Toggle<upnp::tokio::Behaviour>,
 }
-#[derive(Debug)]
+
+/// Tracks which peers have paid for which file batches
+/// Key: (file_hash, peer_id, batch_number)
+#[derive(Debug, Clone, Default)]
+pub struct PaymentWhitelist {
+    /// Set of (file_hash, peer_id_string, batch_number) that have been paid
+    paid_batches: std::collections::HashSet<(String, String, u32)>,
+    /// Pending payments awaiting blockchain confirmation: tx_hash -> (file_hash, peer_id, batch_num)
+    pending_confirmations: std::collections::HashMap<String, (String, String, u32)>,
+}
+
+impl PaymentWhitelist {
+    pub fn new() -> Self {
+        Self::default()
+    }
+    
+    /// Mark a batch as paid for a specific peer
+    pub fn mark_paid(&mut self, file_hash: &str, peer_id: &str, batch_num: u32) {
+        self.paid_batches.insert((file_hash.to_string(), peer_id.to_string(), batch_num));
+    }
+    
+    /// Check if a peer has paid for a specific batch
+    pub fn has_paid(&self, file_hash: &str, peer_id: &str, batch_num: u32) -> bool {
+        self.paid_batches.contains(&(file_hash.to_string(), peer_id.to_string(), batch_num))
+    }
+    
+    /// Check if a peer has paid for a specific chunk (by checking the batch it belongs to)
+    pub fn has_paid_for_chunk(&self, file_hash: &str, peer_id: &str, chunk_index: u32, chunks_per_batch: u32) -> bool {
+        let batch_num = chunk_index / chunks_per_batch;
+        self.has_paid(file_hash, peer_id, batch_num)
+    }
+    
+    /// Add a pending payment waiting for blockchain confirmation
+    pub fn add_pending(&mut self, tx_hash: &str, file_hash: &str, peer_id: &str, batch_num: u32) {
+        self.pending_confirmations.insert(
+            tx_hash.to_string(),
+            (file_hash.to_string(), peer_id.to_string(), batch_num)
+        );
+    }
+    
+    /// Confirm a pending payment and mark it as paid
+    pub fn confirm_payment(&mut self, tx_hash: &str) -> Option<(String, String, u32)> {
+        if let Some((file_hash, peer_id, batch_num)) = self.pending_confirmations.remove(tx_hash) {
+            self.mark_paid(&file_hash, &peer_id, batch_num);
+            Some((file_hash, peer_id, batch_num))
+        } else {
+            None
+        }
+    }
+}
+
+/// Tracks a pending batch download waiting for payment confirmations
+#[derive(Debug, Clone)]
+pub struct PendingBatchDownload {
+    pub file_hash: String,
+    pub file_name: String,
+    pub metadata: FileMetadata,
+    pub cids: Vec<Cid>,
+    pub seeder_peer_id: PeerId,
+    pub total_chunks: u32,
+    pub chunks_per_batch: u32,
+    pub num_batches: u32,
+    pub price_per_chunk: f64,
+    pub seeder_address: Option<String>,
+    pub download_path: String,
+    /// Which batches have been paid and confirmed
+    pub confirmed_batches: std::collections::HashSet<u32>,
+    /// Which batches have had their chunks requested
+    pub requested_batches: std::collections::HashSet<u32>,
+}
+
+impl PendingBatchDownload {
+    /// Check if a batch has been confirmed (paid)
+    pub fn is_batch_confirmed(&self, batch_num: u32) -> bool {
+        self.confirmed_batches.contains(&batch_num)
+    }
+    
+    /// Mark a batch as confirmed
+    pub fn confirm_batch(&mut self, batch_num: u32) {
+        self.confirmed_batches.insert(batch_num);
+    }
+    
+    /// Mark a batch as requested (chunks have been sent to Bitswap)
+    pub fn mark_batch_requested(&mut self, batch_num: u32) {
+        self.requested_batches.insert(batch_num);
+    }
+    
+    /// Check if a batch has been requested
+    pub fn is_batch_requested(&self, batch_num: u32) -> bool {
+        self.requested_batches.contains(&batch_num)
+    }
+    
+    /// Get the CIDs for a specific batch
+    pub fn get_batch_cids(&self, batch_num: u32) -> Vec<Cid> {
+        let start = (batch_num * self.chunks_per_batch) as usize;
+        let end = std::cmp::min(start + self.chunks_per_batch as usize, self.cids.len());
+        self.cids[start..end].to_vec()
+    }
+    
+    /// Check if this is a free download (no payment required)
+    pub fn is_free_download(&self) -> bool {
+        self.price_per_chunk <= 0.0 || self.seeder_address.is_none()
+    }
+    
+    /// Check if all batches are complete
+    pub fn all_batches_requested(&self) -> bool {
+        self.requested_batches.len() as u32 >= self.num_batches
+    }
+}
+
 pub enum DhtCommand {
     PublishFile {
         metadata: FileMetadata,
@@ -344,6 +453,21 @@ pub enum DhtCommand {
         metadata: FileMetadata,
         download_path: String,
         chunks_per_payment_batch: u32,
+    },
+    /// Notify seeder that payment has been made for a batch
+    NotifyPayment {
+        seeder_peer_id: PeerId,
+        file_hash: String,
+        batch_num: u32,
+        tx_hash: String,
+        amount: f64,
+    },
+    /// Confirm a batch payment and trigger chunk download for that batch
+    /// Called by frontend after blockchain confirmation
+    ConfirmBatchPayment {
+        file_hash: String,
+        batch_num: u32,
+        tx_hash: String,
     },
     ConnectPeer(String),
     ConnectToPeerById(PeerId),
@@ -502,11 +626,32 @@ pub enum DhtEvent {
         file_hash: String,
         file_name: String,
         seeder_address: Option<String>,
+        seeder_peer_id: String,
+        batch_num: u32,
         batch_start_chunk: u32,
         batch_end_chunk: u32,
         total_chunks: u32,
         price_per_chunk: f64,
         total_batch_price: f64,
+    },
+    /// Emitted when payment is confirmed and chunks can be requested
+    ChunkBatchPaymentConfirmed {
+        file_hash: String,
+        batch_num: u32,
+        tx_hash: String,
+    },
+    /// Emitted when seeder receives payment notification from buyer
+    PaymentReceivedFromBuyer {
+        file_hash: String,
+        buyer_peer_id: String,
+        batch_num: u32,
+        tx_hash: String,
+        amount: f64,
+    },
+    /// Request to download a specific batch after payment is confirmed
+    RequestBatchDownload {
+        file_hash: String,
+        batch_num: u32,
     },
 }
 
@@ -1389,7 +1534,9 @@ async fn run_dht_node(
             HashMap<rr::OutboundRequestId, oneshot::Sender<Result<EncryptedAesKeyBundle, String>>>,
         >,
     >,
-    pending_search_queries: Arc<Mutex<HashMap<kad::QueryId, PendingSearchQuery>>>, // <-- Added parameter
+    pending_search_queries: Arc<Mutex<HashMap<kad::QueryId, PendingSearchQuery>>>,
+    pending_batch_downloads: Arc<Mutex<HashMap<String, PendingBatchDownload>>>,
+    payment_whitelist: Arc<Mutex<PaymentWhitelist>>,
     is_bootstrap: bool,
     enable_autorelay: bool,
     relay_candidates: HashSet<String>,
@@ -2111,6 +2258,84 @@ async fn run_dht_node(
                                         tried_seeders.len()
                                     ))).await;
                                 }
+                            }
+                            Some(DhtCommand::ConfirmBatchPayment { file_hash, batch_num, tx_hash }) => {
+                                info!("💰 CONFIRM BATCH PAYMENT: Received confirmation for file {} batch {} tx {}",
+                                      file_hash, batch_num, tx_hash);
+                                
+                                // Look up the pending batch download
+                                let mut pending_downloads = pending_batch_downloads.lock().await;
+                                
+                                if let Some(pending_download) = pending_downloads.get_mut(&file_hash) {
+                                    // Mark batch as confirmed
+                                    pending_download.confirm_batch(batch_num);
+                                    info!("💰 CONFIRM BATCH PAYMENT: Marked batch {} as confirmed for file {}",
+                                          batch_num, file_hash);
+                                    
+                                    // Check if batch has already been requested
+                                    if pending_download.is_batch_requested(batch_num) {
+                                        info!("💰 CONFIRM BATCH PAYMENT: Batch {} was already requested, skipping",
+                                              batch_num);
+                                        continue;
+                                    }
+                                    
+                                    // Get the CIDs for this batch
+                                    let batch_cids = pending_download.get_batch_cids(batch_num);
+                                    let seeder_peer_id = pending_download.seeder_peer_id.clone();
+                                    
+                                    info!("💰 CONFIRM BATCH PAYMENT: Requesting {} chunks for batch {} from seeder {}",
+                                          batch_cids.len(), batch_num, seeder_peer_id);
+                                    
+                                    // Request chunks for this batch
+                                    for (i, cid) in batch_cids.iter().enumerate() {
+                                        let chunk_index = (batch_num * pending_download.chunks_per_batch) + i as u32;
+                                        let block_query_id = swarm.behaviour_mut().bitswap.get_from(&cid, seeder_peer_id.clone());
+                                        info!("💰 CONFIRM BATCH PAYMENT: Requested chunk {} (CID: {}) query_id: {:?}",
+                                              chunk_index, cid, block_query_id);
+                                    }
+                                    
+                                    // Mark batch as requested
+                                    pending_download.mark_batch_requested(batch_num);
+                                    
+                                    // Also update the payment whitelist (for seeder-side verification)
+                                    let mut whitelist = payment_whitelist.lock().await;
+                                    whitelist.mark_paid(&file_hash, &seeder_peer_id.to_string(), batch_num);
+                                    drop(whitelist);
+                                    
+                                    // Emit confirmation event
+                                    let _ = event_tx.send(DhtEvent::ChunkBatchPaymentConfirmed {
+                                        file_hash: file_hash.clone(),
+                                        batch_num,
+                                        tx_hash: tx_hash.clone(),
+                                    }).await;
+                                    
+                                    info!("💰 CONFIRM BATCH PAYMENT: Successfully processed batch {} for file {}",
+                                          batch_num, file_hash);
+                                } else {
+                                    warn!("💰 CONFIRM BATCH PAYMENT: No pending download found for file {}", file_hash);
+                                    // This might happen for free downloads or if download was cancelled
+                                }
+                            }
+                            Some(DhtCommand::NotifyPayment { seeder_peer_id, file_hash, batch_num, tx_hash, amount }) => {
+                                info!("💰 NOTIFY PAYMENT: Received payment notification from buyer");
+                                info!("💰 NOTIFY PAYMENT: file={}, batch={}, tx={}, amount={} Chiral",
+                                      file_hash, batch_num, tx_hash, amount);
+                                
+                                // Mark this peer as having paid for this batch
+                                let mut whitelist = payment_whitelist.lock().await;
+                                whitelist.mark_paid(&file_hash, &seeder_peer_id.to_string(), batch_num);
+                                
+                                // Emit event for tracking
+                                let _ = event_tx.send(DhtEvent::PaymentReceivedFromBuyer {
+                                    file_hash: file_hash.clone(),
+                                    buyer_peer_id: seeder_peer_id.to_string(),
+                                    batch_num,
+                                    tx_hash: tx_hash.clone(),
+                                    amount,
+                                }).await;
+                                
+                                info!("💰 NOTIFY PAYMENT: Added payment to whitelist, seeder can now serve batch {} to peer {}",
+                                      batch_num, seeder_peer_id);
                             }
                             Some(DhtCommand::StopPublish(file_hash)) => {
                                 let key = kad::RecordKey::new(&file_hash);
@@ -3194,6 +3419,8 @@ async fn run_dht_node(
                                                         file_hash: metadata.merkle_root.clone(),
                                                         file_name: metadata.file_name.clone(),
                                                         seeder_address: seeder_address.clone(),
+                                                        seeder_peer_id: peer_id.to_string(),
+                                                        batch_num,
                                                         batch_start_chunk: batch_start,
                                                         batch_end_chunk: batch_end,
                                                         total_chunks,
@@ -3207,16 +3434,53 @@ async fn run_dht_node(
                                                     }
                                                 }
                                                 
-                                                info!("💰 PAYMENT: All {} payment events emitted. Now requesting chunks...", num_batches);
+                                                info!("💰 PAYMENT: All {} payment events emitted.", num_batches);
                                                 
-                                                // Now request all chunks (in production, this should wait for payment confirmations)
-                                                for (i, cid) in cids.iter().enumerate() {
-                                                    // Request the block
-                                                    let block_query_id = swarm.behaviour_mut().bitswap.get_from(&cid, peer_id);
-                                                    file_queries.insert(block_query_id, i as u32);
+                                                // Check if this is a free download (price = 0 or self-download)
+                                                let is_free_download = file_price <= 0.0 || seeder_address.is_none();
+                                                
+                                                if is_free_download {
+                                                    // Free download - request all chunks immediately
+                                                    info!("📥 FREE DOWNLOAD: Requesting all {} chunks immediately...", cids.len());
+                                                    
+                                                    for (i, cid) in cids.iter().enumerate() {
+                                                        let block_query_id = swarm.behaviour_mut().bitswap.get_from(&cid, peer_id);
+                                                        file_queries.insert(block_query_id, i as u32);
+                                                    }
+                                                    
+                                                    info!("📥 Requested {} chunks from seeder", cids.len());
+                                                } else {
+                                                    // Paid download - store pending download and wait for payment confirmations
+                                                    info!("💰 PAID DOWNLOAD: Storing download state, waiting for payment confirmations before requesting chunks...");
+                                                    
+                                                    let pending_download = PendingBatchDownload {
+                                                        file_hash: metadata.merkle_root.clone(),
+                                                        file_name: metadata.file_name.clone(),
+                                                        metadata: metadata.clone(),
+                                                        cids: cids.clone(),
+                                                        seeder_peer_id: peer_id.clone(),
+                                                        total_chunks,
+                                                        chunks_per_batch,
+                                                        num_batches,
+                                                        price_per_chunk,
+                                                        seeder_address: seeder_address.clone(),
+                                                        download_path: metadata.download_path.clone().unwrap_or_default(),
+                                                        confirmed_batches: std::collections::HashSet::new(),
+                                                        requested_batches: std::collections::HashSet::new(),
+                                                    };
+                                                    
+                                                    pending_batch_downloads.lock().await.insert(
+                                                        metadata.merkle_root.clone(),
+                                                        pending_download
+                                                    );
+                                                    
+                                                    info!("💰 PAID DOWNLOAD: Download state stored for {}. Frontend must call ConfirmBatchPayment for each batch.", metadata.file_name);
+                                                    info!("💰 PAID DOWNLOAD: {} batches total, waiting for payment confirmations...", num_batches);
+                                                    
+                                                    // Don't request any chunks yet - wait for ConfirmBatchPayment commands
+                                                    // The frontend will call ConfirmBatchPayment after blockchain confirmation
+                                                    // which will trigger RequestBatchChunks
                                                 }
-                                                
-                                                info!("📥 Requested {} chunks from seeder", cids.len());
 
                                                 let total_chunks = cids.len() as u64;
                                                 // assume 256kb
@@ -6790,6 +7054,15 @@ impl DhtService {
         // Add this initialization around line 6100 after pending_dht_queries:
         let pending_search_queries: Arc<Mutex<HashMap<kad::QueryId, PendingSearchQuery>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        
+        // Payment whitelist for tracking which peers have paid for which batches
+        let payment_whitelist: Arc<Mutex<PaymentWhitelist>> =
+            Arc::new(Mutex::new(PaymentWhitelist::new()));
+        
+        // Pending batch downloads waiting for payment confirmations
+        // Key: file_hash
+        let pending_batch_downloads: Arc<Mutex<HashMap<String, PendingBatchDownload>>> =
+            Arc::new(Mutex::new(HashMap::new()));
 
         {
             let mut guard = metrics.lock().await;
@@ -6841,7 +7114,9 @@ impl DhtService {
             file_metadata_cache_local.clone(),
             pending_dht_queries.clone(),
             pending_key_requests.clone(),
-            pending_search_queries.clone(), // Add this parameter to the tokio::spawn call around line 6145:
+            pending_search_queries.clone(),
+            pending_batch_downloads.clone(),
+            payment_whitelist.clone(),
             is_bootstrap,
             final_enable_autorelay,
             relay_candidates,
@@ -7113,6 +7388,25 @@ impl DhtService {
                 metadata: file_metadata,
                 download_path,
                 chunks_per_payment_batch,
+            })
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// Confirm a batch payment and trigger chunk download for that batch
+    pub async fn confirm_batch_payment(
+        &self,
+        file_hash: String,
+        batch_num: u32,
+        tx_hash: String,
+    ) -> Result<(), String> {
+        info!("💰 DhtService::confirm_batch_payment called for: file={}, batch={}, tx={}", 
+              file_hash, batch_num, tx_hash);
+        self.cmd_tx
+            .send(DhtCommand::ConfirmBatchPayment {
+                file_hash,
+                batch_num,
+                tx_hash,
             })
             .await
             .map_err(|e| e.to_string())
