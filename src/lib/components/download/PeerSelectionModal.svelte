@@ -305,11 +305,7 @@
           <div class="flex justify-between items-center">
             <span class="font-medium text-sm">Estimated Cost:</span>
             <span class="text-green-600 dark:text-green-400 font-bold">
-              {#if isSeeding}
-                Free
-              {:else}
-                {Math.max(totalCost, 0.0001).toFixed(4)} Chiral
-              {/if}
+              {Math.max(totalCost, 0.0001).toFixed(4)} Chiral
             </span>
           </div>
           {#if mode === 'manual'}

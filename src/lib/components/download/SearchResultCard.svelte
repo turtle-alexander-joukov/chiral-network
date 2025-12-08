@@ -488,9 +488,7 @@
           <li class="flex items-center justify-between">
             <span class="text-muted-foreground">Price</span>
             <span class="font-semibold text-emerald-600">
-              {#if isSeeding}
-                Free
-              {:else if checkingBalance}
+              {#if checkingBalance}
                 Calculating...
               {:else if currentPrice !== null}
                 {currentPrice.toFixed(4)} Chiral
