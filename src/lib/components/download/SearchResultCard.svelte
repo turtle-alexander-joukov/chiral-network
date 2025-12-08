@@ -604,13 +604,6 @@
             </p>
           </div>
         </div>
-        {#if isSeeding}
-          <div class="p-3 bg-amber-500/10 rounded-lg border border-amber-500/30">
-            <p class="text-xs text-amber-600 text-center">
-              You're already seeding this file. Downloading will create a decrypted local copy.
-            </p>
-          </div>
-        {/if}
       </div>
 
       <p class="text-sm text-muted-foreground text-center mb-6">
